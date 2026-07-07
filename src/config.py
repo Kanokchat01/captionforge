@@ -30,4 +30,14 @@ TOTAL_BUDGET_SECONDS = float(os.environ.get("TOTAL_BUDGET_SECONDS", "540"))
 # Rule: response time per request must be under 30s.
 PER_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("PER_REQUEST_TIMEOUT_SECONDS", "28"))
 
+# Reserved purely for writing the final results.json + process exit. If a
+# worker is still running when (deadline - this) is reached, its result is
+# NOT waited for any further — main.py fills a fallback immediately instead.
+FINALIZATION_RESERVE_SECONDS = float(os.environ.get("FINALIZATION_RESERVE_SECONDS", "30"))
+
+# If a task is picked up by a worker with less than this much time left on
+# the global clock, don't even start the (expensive) Gemini call — go
+# straight to a fallback caption. Prevents starting doomed work.
+CRITICAL_TIME_THRESHOLD_SECONDS = float(os.environ.get("CRITICAL_TIME_THRESHOLD_SECONDS", "45"))
+
 REQUIRED_STYLES = {"formal", "sarcastic", "humorous_tech", "humorous_non_tech"}

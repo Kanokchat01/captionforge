@@ -1,8 +1,17 @@
 """
-Primary caption generator: Gemini 2.5 Flash, native video+audio multimodal
-input, single call per clip returns all requested styles as JSON.
-No separate FFmpeg/Whisper pass needed — Gemini understands the audio track
-that's embedded in the uploaded video file directly.
+Primary caption generator: Gemini 2.5 Flash, two-stage pipeline per the
+team's prompts.md design.
+
+Stage 1: upload video, ask for a structured 10-section Scene Report
+         (video + audio understood natively, no FFmpeg/Whisper needed).
+Stage 2: text-only call using ONLY the Stage 1 report to generate the
+         requested style captions as JSON. Cheaper/faster than a second
+         video call, and forces grounding through the report's RISKS section.
+
+Note: caption_clip() returns (captions, scene_report) as a tuple rather than
+stashing scene_report on self — this class instance is shared across worker
+threads in main.py's ThreadPoolExecutor, so storing per-call state on self
+would race between concurrently-processing clips.
 """
 import json
 import re
@@ -12,7 +21,7 @@ from google import genai
 from google.genai import types
 
 import config
-from prompts import build_caption_prompt
+from prompts import build_caption_generation_prompt, SCENE_ANALYSIS_PROMPT
 
 
 def _extract_json(text: str) -> dict:
@@ -30,6 +39,12 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"Could not parse JSON from Gemini response: {text[:300]}")
 
 
+class SceneAnalysisFailed(Exception):
+    """Raised when Gemini explicitly reports it could not analyze the clip
+    (corrupted/blank/unreadable) rather than silently hallucinating."""
+    pass
+
+
 class GeminiCaptioner:
     def __init__(self, api_key: str = None, model: str = None):
         self.api_key = api_key or config.GEMINI_API_KEY
@@ -38,11 +53,8 @@ class GeminiCaptioner:
         self.model = model or config.GEMINI_MODEL
         self.client = genai.Client(api_key=self.api_key)
 
-    def caption_clip(self, video_path: str, styles: list, max_wait_seconds: int = 90) -> dict:
-        """Upload the clip, wait for it to become ACTIVE, then request all
-        requested styles in one JSON-mode generation call."""
+    def _upload_and_wait(self, video_path: str, max_wait_seconds: int):
         video_file = self.client.files.upload(file=video_path)
-
         waited = 0
         while video_file.state.name == "PROCESSING" and waited < max_wait_seconds:
             time.sleep(3)
@@ -56,26 +68,41 @@ class GeminiCaptioner:
                 pass
             raise RuntimeError(f"Video did not become ACTIVE in time (state={video_file.state.name})")
 
-        prompt = build_caption_prompt(styles)
-        response = self.client.models.generate_content(
+        return video_file
+
+    def caption_clip(self, video_path: str, styles: list, max_wait_seconds: int = 90):
+        """Runs the full 2-stage pipeline for one clip.
+        Returns (captions: dict, scene_report: str)."""
+        video_file = self._upload_and_wait(video_path, max_wait_seconds)
+
+        try:
+            # --- Stage 1: structured scene analysis (video + audio) ---
+            analysis_resp = self.client.models.generate_content(
+                model=self.model,
+                contents=[video_file, SCENE_ANALYSIS_PROMPT],
+                config=types.GenerateContentConfig(temperature=0.4),
+            )
+            scene_report = (analysis_resp.text or "").strip()
+        finally:
+            try:
+                self.client.files.delete(name=video_file.name)
+            except Exception:
+                pass
+
+        if scene_report.upper().startswith("ANALYSIS FAILED"):
+            raise SceneAnalysisFailed(scene_report)
+
+        # --- Stage 2: caption generation, text-only, from the report ---
+        prompt2 = build_caption_generation_prompt(scene_report, styles)
+        gen_resp = self.client.models.generate_content(
             model=self.model,
-            contents=[video_file, prompt],
+            contents=[prompt2],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.7,
+                temperature=0.85,
             ),
         )
 
-        try:
-            self.client.files.delete(name=video_file.name)
-        except Exception:
-            pass
-
-        captions = _extract_json(response.text)
-        # Keep only the styles that were actually requested, as strings.
-        return {s: str(captions.get(s, "")).strip() for s in styles}
-
-    def scene_hint(self, styles_result: dict) -> str:
-        """Cheap scene summary reused as grounding context for the Gemma
-        polish/judge passes, built from the formal caption if present."""
-        return styles_result.get("formal") or next(iter(styles_result.values()), "")
+        captions = _extract_json(gen_resp.text)
+        result = {s: str(captions.get(s, "")).strip() for s in styles}
+        return result, scene_report

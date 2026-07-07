@@ -10,6 +10,21 @@ import requests
 
 DOWNLOAD_TIMEOUT_SECONDS = 30
 MAX_RETRIES = 3
+PROBE_TIMEOUT_SECONDS = 8
+
+
+def probe_size_mb(url: str) -> float:
+    """Cheap HEAD request to estimate clip weight before downloading, so the
+    scheduler can process heavier clips first (avoids a big 4K clip getting
+    stuck at the back of the queue right as the time budget runs out).
+    Returns 0.0 if the size can't be determined — caller should treat that as
+    'unknown weight', not 'zero cost'."""
+    try:
+        resp = requests.head(url, timeout=PROBE_TIMEOUT_SECONDS, allow_redirects=True)
+        size = int(resp.headers.get("Content-Length", 0))
+        return size / (1024 * 1024)
+    except Exception:
+        return 0.0
 
 
 def download_video(url: str, output_dir: str = "/tmp/captionforge_videos") -> str:
