@@ -23,6 +23,19 @@ from google.genai import types
 import config
 from prompts import build_caption_generation_prompt, SCENE_ANALYSIS_PROMPT
 
+# Gemini's own infra occasionally returns transient errors ("high demand,
+# try again later" / 503 / 429 rate limits). A real test run hit this: all
+# 3 clips failed on the very first attempt with zero retry. These are worth
+# retrying briefly before giving up to a fallback caption.
+MAX_API_RETRIES = 2
+RETRY_BACKOFF_SECONDS = [3, 6]
+RETRYABLE_MARKERS = ("503", "429", "unavailable", "rate limit", "resource_exhausted", "timeout", "deadline")
+
+
+def _is_retryable(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in RETRYABLE_MARKERS)
+
 
 def _extract_json(text: str) -> dict:
     try:
@@ -53,6 +66,23 @@ class GeminiCaptioner:
         self.model = model or config.GEMINI_MODEL
         self.client = genai.Client(api_key=self.api_key)
 
+    def _generate_with_retry(self, **kwargs):
+        """Wraps generate_content with a short bounded retry for transient
+        infra errors (503/429/timeout-style). Non-retryable errors (bad
+        request, auth, parsing) raise immediately on the first attempt."""
+        last_exc = None
+        for attempt in range(MAX_API_RETRIES + 1):
+            try:
+                return self.client.models.generate_content(**kwargs)
+            except Exception as e:
+                last_exc = e
+                if attempt < MAX_API_RETRIES and _is_retryable(e):
+                    print(f"[retry] transient Gemini error (attempt {attempt + 1}/{MAX_API_RETRIES + 1}): {e}")
+                    time.sleep(RETRY_BACKOFF_SECONDS[attempt])
+                    continue
+                raise
+        raise last_exc
+
     def _upload_and_wait(self, video_path: str, max_wait_seconds: int):
         video_file = self.client.files.upload(file=video_path)
         waited = 0
@@ -77,7 +107,7 @@ class GeminiCaptioner:
 
         try:
             # --- Stage 1: structured scene analysis (video + audio) ---
-            analysis_resp = self.client.models.generate_content(
+            analysis_resp = self._generate_with_retry(
                 model=self.model,
                 contents=[video_file, SCENE_ANALYSIS_PROMPT],
                 config=types.GenerateContentConfig(temperature=0.4),
@@ -94,7 +124,7 @@ class GeminiCaptioner:
 
         # --- Stage 2: caption generation, text-only, from the report ---
         prompt2 = build_caption_generation_prompt(scene_report, styles)
-        gen_resp = self.client.models.generate_content(
+        gen_resp = self._generate_with_retry(
             model=self.model,
             contents=[prompt2],
             config=types.GenerateContentConfig(

@@ -25,6 +25,22 @@ task's `styles` list requests, or that clip scores zero for the missing
 style. Container must exit 0, must be ready within 60s, and the whole run
 must finish within **10 minutes** total (hidden eval set is ~12 clips).
 
+## Credentials: Track 2 injects NONE — must be baked into the image
+
+Unlike Track 1 (which has `FIREWORKS_API_KEY`/`FIREWORKS_BASE_URL`/`ALLOWED_MODELS`
+injected by the harness), the official guide states Track 2 injects **no**
+API key or model restriction at evaluation time: *"use your own credentials
+inside the container."* The judge just runs `docker run <image>` with no
+`-e` flags. That means our own `GEMINI_API_KEY` (and optionally
+`FIREWORKS_API_KEY`) must be baked into the image itself at **build time**
+via `--build-arg` — relying on `-e` at `docker run` only works for our own
+local testing, not for the real submission.
+
+Never put the real key literally in the `Dockerfile` or commit it to git —
+only pass it on the `docker build`/`buildx build` command line (see below).
+The pushed image will have the key embedded in its layers; treat this
+hackathon key as disposable and rotate/revoke it after the event ends.
+
 ## Setup (local dev)
 
 ```bash
@@ -39,10 +55,9 @@ Submission requires an actual image pushed to a public registry, not just a
 Dockerfile in the repo. Judging VM is `linux/amd64`.
 
 ```bash
-# On Apple Silicon, add --platform linux/amd64
+# Local build/test — either -e at `docker run` OR --build-arg both work here,
+# since this is just for our own testing.
 docker build -t captionforge .
-
-# Local test run (mount /input and /output, pass env vars)
 docker run --rm \
   -e GEMINI_API_KEY=$GEMINI_API_KEY \
   -e FIREWORKS_API_KEY=$FIREWORKS_API_KEY \
@@ -50,8 +65,20 @@ docker run --rm \
   -v $(pwd)/output:/output \
   captionforge
 
-# Push (adjust to your registry)
-docker buildx build --platform linux/amd64 -t ghcr.io/<you>/captionforge:latest --push .
+# REAL SUBMISSION BUILD — bake credentials in via --build-arg so the image
+# is self-contained (the judge will not pass any -e flags). Run this exact
+# form before the final push:
+docker buildx build --platform linux/amd64 \
+  --build-arg GEMINI_API_KEY=$GEMINI_API_KEY \
+  --build-arg FIREWORKS_API_KEY=$FIREWORKS_API_KEY \
+  -t ghcr.io/<you>/captionforge:latest --push .
+
+# Sanity-check it actually works with ZERO -e flags, exactly like the judge
+# will run it:
+docker run --rm \
+  -v $(pwd)/input:/input \
+  -v $(pwd)/output:/output \
+  ghcr.io/<you>/captionforge:latest
 ```
 
 ## Design notes / risks to keep testing against
@@ -59,32 +86,42 @@ docker buildx build --platform linux/amd64 -t ghcr.io/<you>/captionforge:latest 
 - **No FFmpeg/Whisper step.** Gemini 2.5 Flash reads the video file directly
   and understands the embedded audio natively, so there's no separate
   audio-extraction pass to keep in budget.
-- **10-minute hard ceiling drives the architecture.** Clips are processed
-  concurrently (`CONCURRENCY` in `.env`, default 4) instead of one at a time.
-  `TOTAL_BUDGET_SECONDS` (default 540s, 1-minute safety margin) is checked
-  before starting the optional Gemma polish/self-critique steps for each
-  caption — if the budget's tight, the pipeline ships the raw Gemini caption
-  instead of skipping the clip entirely.
+- **10-minute hard ceiling drives the architecture.** Clips are probed and
+  scheduled heaviest-first, processed concurrently (`CONCURRENCY` in `.env`,
+  default 4), and a hard wall-clock deadline (`TOTAL_BUDGET_SECONDS`) is
+  enforced with `concurrent.futures.wait(..., timeout=...)` — any clip not
+  done in time gets an immediate fallback caption instead of blocking the
+  rest of the run. `os._exit(0)` at the end guarantees the process can't
+  hang waiting on a stuck background thread.
 - **Self-critique is capped**, `MAX_CRITIQUE_RETRIES=2`, to avoid infinite
   loops and to bound worst-case latency per clip.
 - **Gemma polish/critique failures never break a clip** — every Fireworks
   call in `gemma_polish.py` falls back to the unpolished Gemini caption on
   any exception.
+- **2-stage prompt pipeline** (`prompts.py`): Stage 1 asks Gemini for a
+  structured 10-section Scene Report (subject, environment, timeline,
+  camera, lighting, audio, mood, standout details, humor potential, and a
+  RISKS section listing what is NOT shown, to suppress hallucination).
+  Stage 2 is a text-only call that writes the 4 styled captions from that
+  report only, following strict word-count/banned-word/structural rules.
 - **Must generalize beyond the 3 sample clips** in `input/tasks.json` — the
   hidden eval set spans nature, urban, animals, people, sports, food,
   weather, and technology. Don't tune prompts to only these three scenes.
-- **Untested assumption:** actual upload+processing latency for large 4K
-  sample clips on Gemini's side. Time a real run against all 3 sample clips
-  first and tune `TOTAL_BUDGET_SECONDS` / `CONCURRENCY` / the
-  `max_wait_seconds` in `gemini_client.py` before relying on the defaults.
+- **Timing rule ambiguity:** the general rules list "response time per
+  request must be under 30 seconds" for all tracks, but Track 2's own
+  section only specifies the 10-minute total budget with no per-clip cap —
+  a single Gemini video-analysis call can legitimately take longer than 30s
+  for a 2-minute 4K clip. Read is that the 30s rule targets Track 1's
+  live request/response pattern; Track 2's explicit 10-minute total is the
+  governing constraint here. Flagged as an assumption, not a certainty.
 
 ## File map
 
 - `src/main.py` — orchestration, concurrency, time budget, fallback handling
-- `src/gemini_client.py` — primary caption generation (Gemini 2.5 Flash)
+- `src/gemini_client.py` — primary caption generation (Gemini 2.5 Flash, 2-stage)
 - `src/gemma_polish.py` — optional Gemma polish + self-critique (Fireworks)
 - `src/prompts.py` — all prompt text and style definitions
-- `src/downloader.py` — clip download with retry/timeout
+- `src/downloader.py` — clip download with retry/timeout + size probing
 - `src/config.py` — all tunables, env-var driven
 - `judge.py`, `fireworks_client.py`, `video_utils.py` — deprecated, kept only
   so old imports don't crash; do not extend these

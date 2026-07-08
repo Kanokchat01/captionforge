@@ -130,10 +130,21 @@ docker login ghcr.io -u <ชื่อ GitHub username>
 # ตอนถาม password ให้วาง token (ไม่ใช่รหัสผ่าน GitHub จริง)
 
 # 3. Build แบบระบุ platform ให้ตรงกับ judging VM แล้ว push
-docker buildx build --platform linux/amd64 -t ghcr.io/<username>/captionforge:latest --push .
+# สำคัญมาก: Track 2 กรรมการรัน `docker run` เฉยๆ ไม่ส่ง -e ให้เราเลย
+# (ต่างจาก Track 1) ต้องฝัง API key เข้าไปใน image ตอน build ด้วย --build-arg
+docker buildx build --platform linux/amd64 `
+  --build-arg GEMINI_API_KEY=$env:GEMINI_API_KEY `
+  --build-arg FIREWORKS_API_KEY=$env:FIREWORKS_API_KEY `
+  -t ghcr.io/<username>/captionforge:latest --push .
 ```
 
 จากนั้นเข้า GitHub → โปรไฟล์ → **Packages** → เลือก package `captionforge` → **Package settings** → เปลี่ยน visibility เป็น **Public** (สำคัญมาก ไม่งั้นกรรมการ pull ไม่ได้ จะได้ 0 คะแนนทันที)
+
+**เช็คให้ชัวร์ว่า key ฝังเข้า image จริง** ลองรันแบบไม่ใส่ `-e` เลยดู (จำลองแบบที่กรรมการจะรัน):
+```powershell
+docker run --rm -v ${PWD}/input:/input -v ${PWD}/output:/output ghcr.io/<username>/captionforge:latest
+```
+ถ้าไม่มี `-e` แล้วยังรันได้ผลลัพธ์ปกติ แปลว่า key ฝังเข้า image สำเร็จแล้ว
 
 **เช็คผ่าน:** เปิด browser โหมด incognito (ไม่ล็อกอิน) แล้วเข้า `https://github.com/<username>?tab=packages` เห็น package นั้นได้โดยไม่ต้อง login
 
