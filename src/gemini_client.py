@@ -30,11 +30,34 @@ from prompts import build_caption_generation_prompt, SCENE_ANALYSIS_PROMPT
 MAX_API_RETRIES = 2
 RETRY_BACKOFF_SECONDS = [3, 6]
 RETRYABLE_MARKERS = ("503", "429", "unavailable", "rate limit", "resource_exhausted", "timeout", "deadline")
+MAX_RETRY_DELAY_SECONDS = 25  # cap so one clip can't eat the whole run budget
 
 
 def _is_retryable(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(marker in msg for marker in RETRYABLE_MARKERS)
+
+
+def _extract_retry_delay_seconds(exc: Exception):
+    """Gemini's 429/RESOURCE_EXHAUSTED errors include a RetryInfo block with
+    the server's own suggested wait (e.g. 'retryDelay': '16s') — a real test
+    run at 8 concurrent clips hit the free tier's 5 requests/minute cap, and
+    our old fixed 3s/6s backoff was far shorter than the ~16s the API
+    actually asked for, so retries kept failing immediately. Prefer the
+    server's number when we can parse it; fall back to the fixed schedule
+    otherwise (e.g. for 503s, which don't carry a RetryInfo block)."""
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return None
+    try:
+        error_details = details.get("error", {}).get("details", [])
+        for d in error_details:
+            if isinstance(d, dict) and str(d.get("@type", "")).endswith("RetryInfo"):
+                raw = str(d.get("retryDelay", "")).rstrip("s")
+                return min(float(raw), MAX_RETRY_DELAY_SECONDS)
+    except Exception:
+        pass
+    return None
 
 
 def _extract_json(text: str) -> dict:
@@ -77,14 +100,28 @@ class GeminiCaptioner:
             except Exception as e:
                 last_exc = e
                 if attempt < MAX_API_RETRIES and _is_retryable(e):
-                    print(f"[retry] transient Gemini error (attempt {attempt + 1}/{MAX_API_RETRIES + 1}): {e}")
-                    time.sleep(RETRY_BACKOFF_SECONDS[attempt])
+                    server_delay = _extract_retry_delay_seconds(e)
+                    delay = server_delay if server_delay is not None else RETRY_BACKOFF_SECONDS[attempt]
+                    print(f"[retry] transient Gemini error (attempt {attempt + 1}/{MAX_API_RETRIES + 1}, "
+                          f"waiting {delay:.0f}s): {e}")
+                    time.sleep(delay)
                     continue
                 raise
         raise last_exc
 
     def _upload_and_wait(self, video_path: str, max_wait_seconds: int):
-        video_file = self.client.files.upload(file=video_path)
+        # Explicit mime_type instead of relying on the SDK's filename-based
+        # guess: a real test with Google-Drive-hosted clips
+        # (uc?export=download&id=...) hit "Unknown mime type" on every one
+        # of them, because the downloaded local file has no .mp4 extension
+        # for the SDK to sniff from. Since the whole pipeline's contract is
+        # "video_url always points to a video clip", forcing video/mp4 here
+        # makes the upload robust to whatever shape the URL takes, not just
+        # the ones that happen to end in a recognizable file extension.
+        video_file = self.client.files.upload(
+            file=video_path,
+            config=types.UploadFileConfig(mime_type="video/mp4"),
+        )
         waited = 0
         while video_file.state.name == "PROCESSING" and waited < max_wait_seconds:
             time.sleep(3)

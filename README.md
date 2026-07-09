@@ -41,6 +41,20 @@ only pass it on the `docker build`/`buildx build` command line (see below).
 The pushed image will have the key embedded in its layers; treat this
 hackathon key as disposable and rotate/revoke it after the event ends.
 
+## Gemma bonus: Fireworks is required, OpenRouter is dev/test only
+
+The official hackathon page states Gemma is accessed "through Fireworks AI
+and AMD Developer Cloud" for this event — that's the sanctioned path for the
+**Best Use of Gemma bonus ($3,000 for Track 2)**. To avoid burning the
+limited $50 Fireworks credit while iterating on prompts, `gemma_polish.py`
+supports an optional dev-only override to OpenRouter's free Gemma model
+(`GEMMA_PROVIDER=openrouter` in `.env`, see `.env.example`). **Never set
+this for the real submission build** — leave `GEMMA_PROVIDER` unset (it
+defaults to `"fireworks"`) so the pushed image only ever calls Gemma via
+Fireworks. The Dockerfile does not bake `GEMMA_PROVIDER` or
+`OPENROUTER_API_KEY` at all, so the submission image is safe by default
+even if you forget to unset it locally.
+
 ## Setup (local dev)
 
 ```bash

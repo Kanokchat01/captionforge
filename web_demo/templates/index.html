@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CaptionForge — Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-top: #0b0e1a;
+    --bg-bottom: #241a4a;
+    --card-bg: rgba(18, 20, 38, 0.92);
+    --formal: #4285F4;
+    --sarcastic: #EAB308;
+    --humorous_tech: #7C3AED;
+    --humorous_non_tech: #0EA5A4;
+    --text-dim: #b7bcd8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: 'Poppins', sans-serif;
+    color: #fff;
+    background: linear-gradient(160deg, var(--bg-top), var(--bg-bottom) 70%);
+    padding: 40px 24px 80px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  .badge {
+    display: inline-block;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    padding: 8px 18px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.18);
+    margin-bottom: 18px;
+  }
+  h1 { font-size: 42px; font-weight: 700; margin: 0 0 6px; }
+  .subtitle { color: var(--text-dim); font-size: 16px; margin-bottom: 32px; }
+
+  .panel {
+    background: var(--card-bg);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 20px;
+    padding: 28px;
+    margin-bottom: 24px;
+  }
+  label { font-size: 14px; font-weight: 600; color: var(--text-dim); display: block; margin-bottom: 8px; }
+  input[type=text] {
+    width: 100%;
+    padding: 14px 16px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.06);
+    color: #fff;
+    font-family: inherit;
+    font-size: 15px;
+    margin-bottom: 20px;
+  }
+  input[type=text]:focus { outline: 2px solid #7C3AED; }
+  .styles-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 24px; }
+  .style-chip {
+    position: relative;
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 16px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.15);
+    cursor: pointer;
+    font-size: 14px;
+    user-select: none;
+  }
+  .style-chip input { display: none; }
+  .style-chip .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .style-chip.active { background: rgba(255,255,255,0.16); border-color: rgba(255,255,255,0.4); }
+
+  button#go {
+    width: 100%;
+    padding: 16px;
+    border: none;
+    border-radius: 14px;
+    background: linear-gradient(135deg, #4285F4, #7C3AED);
+    color: #fff;
+    font-family: inherit;
+    font-size: 16px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  button#go:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  #status { margin-top: 18px; font-size: 14px; color: var(--text-dim); display: none; }
+  #status.show { display: flex; align-items: center; gap: 10px; }
+  .spinner {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,0.25); border-top-color: #fff;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #error {
+    display: none;
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    color: #fecaca;
+    padding: 16px 18px;
+    border-radius: 12px;
+    margin-bottom: 24px;
+    font-size: 14px;
+  }
+
+  #results { display: none; }
+  .meta-row { display: flex; gap: 10px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
+  .meta-pill {
+    font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 999px;
+    background: rgba(255,255,255,0.08); color: var(--text-dim);
+  }
+  .caption-card {
+    border-radius: 16px;
+    padding: 20px 22px;
+    margin-bottom: 14px;
+    background: rgba(255,255,255,0.05);
+    border-left: 5px solid transparent;
+  }
+  .caption-card .style-label {
+    font-size: 12px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; margin-bottom: 8px; display: inline-block;
+  }
+  .caption-card .caption-text { font-size: 17px; line-height: 1.5; }
+
+  details {
+    background: rgba(255,255,255,0.04);
+    border-radius: 14px;
+    padding: 16px 20px;
+    margin-top: 10px;
+  }
+  summary { cursor: pointer; font-weight: 600; color: var(--text-dim); }
+  pre {
+    white-space: pre-wrap;
+    font-family: 'Poppins', sans-serif;
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-top: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="badge">AMD Developer Hackathon · Act II — Track 2</span>
+  <h1>CaptionForge — Demo</h1>
+  <p class="subtitle">Paste a video URL, pick styles, and watch the 2-stage Gemini pipeline (+ optional Gemma polish) generate captions.</p>
+
+  <div class="panel">
+    <label for="video_url">Video URL (direct .mp4 link)</label>
+    <input type="text" id="video_url" placeholder="https://example.com/clip.mp4">
+
+    <label>Styles</label>
+    <div class="styles-row" id="styles-row">
+      <label class="style-chip active" data-style="formal" style="--c: var(--formal)">
+        <input type="checkbox" value="formal" checked>
+        <span class="dot" style="background: var(--formal)"></span> Formal
+      </label>
+      <label class="style-chip active" data-style="sarcastic" style="--c: var(--sarcastic)">
+        <input type="checkbox" value="sarcastic" checked>
+        <span class="dot" style="background: var(--sarcastic)"></span> Sarcastic
+      </label>
+      <label class="style-chip active" data-style="humorous_tech" style="--c: var(--humorous_tech)">
+        <input type="checkbox" value="humorous_tech" checked>
+        <span class="dot" style="background: var(--humorous_tech)"></span> Humorous (Tech)
+      </label>
+      <label class="style-chip active" data-style="humorous_non_tech" style="--c: var(--humorous_non_tech)">
+        <input type="checkbox" value="humorous_non_tech" checked>
+        <span class="dot" style="background: var(--humorous_non_tech)"></span> Humorous (Non-tech)
+      </label>
+    </div>
+
+    <button id="go">Generate Captions</button>
+
+    <div id="status">
+      <div class="spinner"></div>
+      <span id="status-text">Downloading and analyzing the clip — this can take 20–90s...</span>
+    </div>
+  </div>
+
+  <div id="error"></div>
+
+  <div id="results">
+    <div class="meta-row" id="meta-row"></div>
+    <div id="captions"></div>
+    <details>
+      <summary>Scene Report (Stage 1 output — what Gemini actually saw)</summary>
+      <pre id="scene-report"></pre>
+    </details>
+  </div>
+</div>
+
+<script>
+const STYLE_LABELS = {
+  formal: "Formal",
+  sarcastic: "Sarcastic",
+  humorous_tech: "Humorous (Tech)",
+  humorous_non_tech: "Humorous (Non-tech)"
+};
+const STYLE_VARS = {
+  formal: "--formal",
+  sarcastic: "--sarcastic",
+  humorous_tech: "--humorous_tech",
+  humorous_non_tech: "--humorous_non_tech"
+};
+
+document.querySelectorAll(".style-chip").forEach(chip => {
+  chip.addEventListener("click", () => {
+    const box = chip.querySelector("input");
+    setTimeout(() => chip.classList.toggle("active", box.checked), 0);
+  });
+});
+
+const goBtn = document.getElementById("go");
+const statusEl = document.getElementById("status");
+const statusText = document.getElementById("status-text");
+const errorEl = document.getElementById("error");
+const resultsEl = document.getElementById("results");
+const captionsEl = document.getElementById("captions");
+const metaRowEl = document.getElementById("meta-row");
+const sceneReportEl = document.getElementById("scene-report");
+
+goBtn.addEventListener("click", async () => {
+  const videoUrl = document.getElementById("video_url").value.trim();
+  const styles = Array.from(document.querySelectorAll(".style-chip input:checked")).map(i => i.value);
+
+  errorEl.style.display = "none";
+  resultsEl.style.display = "none";
+
+  if (!videoUrl) {
+    errorEl.textContent = "Please paste a video URL first.";
+    errorEl.style.display = "block";
+    return;
+  }
+  if (styles.length === 0) {
+    errorEl.textContent = "Pick at least one style.";
+    errorEl.style.display = "block";
+    return;
+  }
+
+  goBtn.disabled = true;
+  statusEl.classList.add("show");
+  statusText.textContent = "Downloading and analyzing the clip — this can take 20-90s...";
+
+  try {
+    const resp = await fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ video_url: videoUrl, styles: styles })
+    });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      errorEl.textContent = data.error || "Something went wrong.";
+      errorEl.style.display = "block";
+      return;
+    }
+
+    metaRowEl.innerHTML = "";
+    const pills = [
+      `${data.elapsed_seconds}s total`,
+      data.gemma_available ? (data.gemma_used ? "Gemma polish applied" : "Gemma available, not used") : "Gemini-only (no FIREWORKS_API_KEY)"
+    ];
+    pills.forEach(p => {
+      const el = document.createElement("span");
+      el.className = "meta-pill";
+      el.textContent = p;
+      metaRowEl.appendChild(el);
+    });
+
+    captionsEl.innerHTML = "";
+    Object.entries(data.captions).forEach(([style, caption]) => {
+      const card = document.createElement("div");
+      card.className = "caption-card";
+      card.style.borderLeftColor = `var(${STYLE_VARS[style] || "--formal"})`;
+      card.innerHTML = `<span class="style-label" style="color: var(${STYLE_VARS[style] || "--formal"})">${STYLE_LABELS[style] || style}</span>
+                         <div class="caption-text">${caption}</div>`;
+      captionsEl.appendChild(card);
+    });
+
+    sceneReportEl.textContent = data.scene_report || "(no scene report returned)";
+    resultsEl.style.display = "block";
+
+  } catch (e) {
+    errorEl.textContent = "Request failed: " + e.message;
+    errorEl.style.display = "block";
+  } finally {
+    goBtn.disabled = false;
+    statusEl.classList.remove("show");
+  }
+});
+</script>
+</body>
+</html>

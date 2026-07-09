@@ -2,6 +2,13 @@
 # Apple Silicon: docker buildx build --platform linux/amd64 -t <tag> --push .
 FROM python:3.11-slim
 
+# ffmpeg is only used by the optional CAPTION_PROVIDER=fireworks_vision path
+# (frame extraction for fireworks_vision_client.py) — harmless/unused if the
+# default "gemini" provider stays selected, but must be present in the image
+# in case that path is ever the one selected at build/run time.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

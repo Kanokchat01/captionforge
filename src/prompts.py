@@ -108,6 +108,82 @@ Important:
 - If unsure about something, say "possibly" or "appears to be." Anything marked this way should be treated as unconfirmed, not fact.
 """
 
+
+def build_frame_scene_analysis_prompt(frame_timestamps, video_duration):
+    """Stage 1 prompt variant for the Fireworks frame-based path (no native
+    video/audio call available — see config.CAPTION_PROVIDER comment). The
+    model only receives N still frames as images, at the given timestamps,
+    and NO audio at all (Fireworks' Whisper endpoints were confirmed
+    discontinued as of 2026-06-10). Same 10-section report shape as
+    SCENE_ANALYSIS_PROMPT so build_caption_generation_prompt (Stage 2) needs
+    no changes at all — section 6 (AUDIO) is simply forced to "No audio
+    present" instead of asking the model to guess at sound it never got."""
+    ts_list = ", ".join("{:.1f}s".format(t) for t in frame_timestamps)
+    header = (
+        "You are a professional video analyst. You are given "
+        + str(len(frame_timestamps))
+        + " still frames sampled from a "
+        + "{:.0f}".format(video_duration)
+        + "-second video, in chronological order, taken at approximately "
+        "these timestamps: " + ts_list + ". You do NOT have the audio "
+        "track — do not guess at or invent any sound, dialogue, or music."
+    )
+    return header + """
+
+If the frames cannot be analyzed (corrupted, blank, no visual content), write only: "ANALYSIS FAILED: [brief reason]" and stop. Do not guess or invent content you cannot actually see.
+
+Pay close attention to: visual details, actions implied by how the scene changes between frames, camera work, lighting, and mood. Treat gaps between frames as unknown — do not invent what happened between them.
+
+Keep each section concise — 2-4 sentences, except Key Actions and Standout Details which may use short bullet points. Avoid padding with generic description.
+
+Write your report in the following 10 sections:
+
+--- SCENE REPORT ---
+
+1. SUBJECT
+Who or what is the main focus? Describe appearance in detail (species, color, size, clothing, expression, distinguishing features).
+
+2. ENVIRONMENT
+Where does this take place? Describe the setting, surfaces, objects, background elements, weather, and time of day.
+
+3. KEY ACTIONS (timeline)
+List what changes across the sampled frames, chronologically, using the frame timestamps given above.
+Format: [MM:SS] Action/description at that frame.
+Example: [00:03] A kitten sits behind leafy branches, looking at the camera.
+
+4. CAMERA & FRAMING
+Describe the camera angle (low, high, eye-level) and framing (close-up, wide shot, depth of field) as seen across the frames. Only describe movement (pan/tilt/tracking) if it can be confidently inferred from how framing changes between frames — otherwise say "static or unknown."
+
+5. LIGHTING & COLOR
+Describe the dominant light source, color palette, contrast, and any notable visual effects (lens flare, bokeh, golden hour glow, neon).
+
+6. AUDIO
+No audio track was provided for analysis. Write exactly: "No audio present." Do not guess at implied or expected sounds.
+
+7. MOOD & ATMOSPHERE
+What emotion do the frames evoke? (e.g., peaceful, chaotic, tense, heartwarming, eerie, comedic)
+
+8. STANDOUT DETAILS
+List 3-5 specific, quirky, or memorable details that make this video unique. These are the best ingredients for humor and captions.
+Example: "The kitten's fur is backlit by sunlight, creating a golden halo effect."
+
+9. HUMOR POTENTIAL
+What is naturally funny, ironic, cute, dramatic, or absurd about this video? Think like a meme creator. Identify the 'comedy goldmine' moments.
+Base this only on what is visually confirmed in sections 1-5 — not on assumed intent, thoughts, or emotions the subject cannot literally express. If a subject "looks annoyed," describe the visible expression, don't assert the subject IS annoyed.
+
+10. RISKS (things NOT confirmed)
+List anything a caption writer might assume or hallucinate that is NOT actually shown across the sampled frames, including anything that might have happened in the gaps between frames, and note that no audio was available.
+Example: "No butterflies visible. No other animals. No human hands shown. No audio track analyzed."
+
+--- END REPORT ---
+
+Important:
+- Be specific, not generic. "Orange tabby kitten" not just "a cat."
+- Describe what you actually SEE in these specific frames, not what you assume happens between them.
+- If unsure about something, say "possibly" or "appears to be." Anything marked this way should be treated as unconfirmed, not fact.
+"""
+
+
 CAPTION_GENERATION_SHARED_RULES = """If the video analysis lacks sufficient detail for a style's word count, write a shorter, purely factual caption instead of inventing content to fill the length.
 
 Rules:
@@ -134,7 +210,7 @@ WRONG vs RIGHT:
 ✅ "This cat treats the garden like its personal jungle gym\""""
 
 
-def build_caption_generation_prompt(scene_report: str, styles: list[str]) -> str:
+def build_caption_generation_prompt(scene_report: str, styles: list) -> str:
     """Stage 2 prompt: text-only, works purely from the Stage 1 Scene Report
     (no video re-attached — cheaper and faster than a second video call)."""
     style_blocks = "\n\n".join(STYLE_RULES.get(s, f"{s.upper()} (15-25 words): write in this requested style.") for s in styles)

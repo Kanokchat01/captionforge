@@ -13,10 +13,12 @@
 4. copy key เก็บไว้ (จะเอาไปใส่ `.env`)
 
 ### 0.2 Fireworks API Key (ไม่บังคับ แต่ต้องมีถ้าอยากได้รางวัล Gemma bonus)
-1. เช็คก่อนว่า credit จาก AMD AI Developer Program เข้าหรือยัง (ล็อกอิน fireworks.ai ด้วยบัญชีเดียวกับที่สมัคร ADP)
+1. เช็คก่อนว่า credit จาก AMD AI Developer Program เข้าหรือยัง (ล็อกอิน fireworks.ai ด้วยบัญชีเดียวกับที่สมัคร ADP) — สังเกตว่ามี credit 2 ก้อนแยกกัน: **Hackathon credits** ($50 Fireworks ที่ผู้เข้าแข่งขัน**ทุกคน**ได้ ไม่ต้องรอ approve) กับ **New member credits** ($100 AMD + $50 Fireworks สำหรับคนสมัคร ADP ใหม่ ต้องรอ approve 2-3 วัน) — เช็ค Discord ว่าก้อนแรกมาหรือยัง
 2. ถ้ามีแล้ว ไปหน้า **API Keys** ใน dashboard ของ fireworks.ai แล้ว copy key
 
 **เช็คผ่าน:** มี string ของ Gemini key (ขึ้นต้นแบบ `AIza...`) พร้อมวางแล้ว
+
+**หมายเหตุ:** กติกาทางการระบุว่า Gemma bonus ($3,000 สำหรับ Track 2) ต้องเข้าถึง Gemma ผ่าน Fireworks AI เท่านั้น ถ้าอยากทดสอบ prompt เล่นๆ ก่อนโดยไม่เปลืองเครดิต Fireworks ที่มีจำกัด สามารถตั้ง `GEMMA_PROVIDER=openrouter` ใน `.env` ชั่วคราวเพื่อใช้ Gemma รุ่นฟรีของ OpenRouter แทนได้ (ดูคอมเมนต์ใน `.env.example`) แต่ตอน build image จริงสำหรับส่งงาน **ห้ามใส่ `GEMMA_PROVIDER=openrouter` เด็ดขาด** ต้องปล่อยว่างไว้ (default เป็น fireworks อัตโนมัติ)
 
 ---
 
