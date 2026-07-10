@@ -45,10 +45,14 @@ STYLE_RULES = {
         'tech concepts. Punchy, one core joke. 1 emoji.'
     ),
     "humorous_non_tech": (
-        'HUMOROUS_NON_TECH (15-25 words): Start with "POV:", "When you", '
-        '"Me trying to", or "That feeling when". Write a situation '
-        'everyone has experienced. Keep it simple and relatable. 1 emoji '
-        'matching video content.'
+        'HUMOROUS_NON_TECH (15-25 words): Rotated openings. Start strictly with '
+        'one of these four phrases based on the scene context: "POV:", "When you", '
+        '"Me trying to", or "That feeling when". Connect to highly relatable, everyday '
+        'human struggles, social anxiety, work exhaustion, or awkward moments. Vary your '
+        'scenarios dynamically depending on the video domain (e.g., exhaustion for sports, '
+        'extreme hunger for food, social dread for interviews/news, rhythm tracking for music, '
+        'or weather ruined plans). Never use a repetitive or generic formula. Keep it punchy. '
+        'End with exactly 1 relevant emoji.'
     ),
 }
 
@@ -199,15 +203,22 @@ Grounding: Every claim must come from the video analysis report above. Check the
 BANNED WORDS (never use — they sound like AI):
 thoroughfare, bustling, captivating, witnessing, observing, commences, showcases, delves, furthermore, utilizing, vibrant, pivotal, intricate, landscape, tapestry, multifaceted, underscores, endeavor, realm
 
-WRONG vs RIGHT:
-❌ "An urban thoroughfare bustles with continuous vehicle movement"
-✅ "A steady stream of cars flows down a wide city road"
-❌ "Witnessing the captivating, never-ending urban grind"
-✅ "Just another day of cars pretending they have somewhere important to be"
-❌ "Observing the city's CI/CD pipeline in full swing"
-✅ "This traffic has zero throughput and maximum latency"
-❌ "The feline is observed navigating through the verdant foliage"
-✅ "This cat treats the garden like its personal jungle gym\""""
+WRONG vs RIGHT FOR HUMOROUS_NON_TECH (Dynamic Scenarios Based on Domain):
+❌ "POV: When you get stuck in the bustling urban grid during rush hour"
+✅ "When you get stuck in afternoon traffic and realize everyone else is also pretending to have somewhere important to be 🚗"
+❌ "POV: When the feline navigates the green garden foliage"
+✅ "POV: You open a bag of snacks as quietly as possible, but the local furry overlord still hears it from a mile away 🍗"
+❌ "Me trying to see the beautiful landscape and mountains in the quiet nature"
+✅ "That feeling when you escape to nature for some peace, but the absolute silence starts making you feel highly suspicious 🌲"
+❌ "POV: Looking at the person playing musical instruments or reporting news"
+✅ "Me trying to nod along to the complex jazz solo like I actually understand music theory 🎸"
+❌ "When you watch the news reporter talk on television"
+✅ "POV: The professor randomly calls your name to explain the reading material you did not even open 🎤"
+❌ "Me trying to exercise or run on the sports field"
+✅ "Me trying to finish the last set of squats when my legs are already acting like jelly 🏋️"
+❌ "That feeling when you see delicious food on the table"
+✅ "That feeling when the waiter passes your table with food, but it is actually for the person behind you 🍕"
+"""
 
 
 def build_caption_generation_prompt(scene_report: str, styles: list) -> str:
@@ -231,7 +242,7 @@ Output JSON only with exactly these keys: {{{keys_example}}}
 """
 
 
-GEMMA_POLISH_SYSTEM_PROMPT = (
+QWEN_POLISH_SYSTEM_PROMPT = (
     "You punch up captions for humor and technical/sarcastic wit, without "
     "changing the underlying facts. You are given the video's scene details "
     "and a draft caption. Rewrite it to be funnier and sharper in the same "
@@ -242,7 +253,7 @@ GEMMA_POLISH_SYSTEM_PROMPT = (
 )
 
 
-def build_gemma_polish_prompt(style: str, scene_hint: str, draft_caption: str) -> str:
+def build_qwen_polish_prompt(style: str, scene_hint: str, draft_caption: str) -> str:
     return (
         f"Style: {style} ({STYLE_DESCRIPTIONS.get(style, '')})\n"
         f"Scene details: {scene_hint}\n"
