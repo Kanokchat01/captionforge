@@ -4,78 +4,76 @@ Track 2 rules ("no restriction, use your own credentials") are respected —
 nothing is hardcoded, nothing bundled into the image.
 """
 import os
+import socket
+
+# Auto-add winget-installed Gyan.FFmpeg to PATH on Windows to support local testing
+if os.name == "nt":
+    winget_packages_dir = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages")
+    if os.path.exists(winget_packages_dir):
+        for root, dirs, files in os.walk(winget_packages_dir):
+            if "ffmpeg.exe" in files:
+                os.environ["PATH"] = root + os.pathsep + os.environ["PATH"]
+                break
+
+# Set socket timeout to prevent indefinite hangs in requests stream iteration
+socket.setdefaulttimeout(40)
+
+KEEP_DOWNLOADS = os.environ.get("KEEP_DOWNLOADS", "false").lower() == "true"
 
 # --- Required for the primary (base caption) pass ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
-# --- Which engine analyzes the raw video and writes the Scene Report ---
-# "fireworks_vision" (default as of the real 12-clip test): extracts frames
-# with ffmpeg and sends them as images to a Fireworks-hosted vision model
-# (MiniMax M3), then writes captions via a Fireworks text call — same 2-stage
-# shape as the Gemini path. Chosen as the main path because it: (a) verified
-# working end-to-end on a real 12-clip run (124.2s, 0 timeouts, good caption
-# quality) at the actual hidden-eval scale, (b) doesn't depend on Gemini's
-# finicky free-tier request quota at all, (c) consolidates everything onto
-# Fireworks credentials already in use for the Gemma bonus. Trade-off: this
-# path is frames-only — NO audio understanding. Fireworks' own chat
-# completions endpoint has no confirmed raw-video-file input (only image_url
-# in their own docs/examples), and Fireworks' Whisper/audio-transcription
-# endpoints were confirmed discontinued (returning 401) as of 2026-06-10, so
-# there is currently no way to recover audio understanding on this path.
-# "gemini": fallback/alternate — Gemini reads the video file natively
-# (video+audio), proven at 8-clip scale, but subject to Gemini's own
-# per-project free-tier request quota (see gemini_client.py comments).
-CAPTION_PROVIDER = os.environ.get("CAPTION_PROVIDER", "fireworks_vision").lower()  # "fireworks_vision" | "gemini"
-FIREWORKS_VISION_MODEL = os.environ.get("FIREWORKS_VISION_MODEL", "accounts/fireworks/models/minimax-m3")
-FIREWORKS_TEXT_MODEL = os.environ.get("FIREWORKS_TEXT_MODEL", "accounts/fireworks/models/minimax-m3")
-MAX_FRAMES_PER_CLIP = int(os.environ.get("MAX_FRAMES_PER_CLIP", "8"))
-# Real test with actual 1440p/4K source clips hit "write operation timed
-# out" uploading un-resized frames (a handful of multi-MB JPEGs at native
-# resolution add up fast on typical home upload bandwidth). Downscale before
-# base64-encoding — 768px is plenty for scene description and cuts payload
-# size drastically, which also lowers Fireworks vision-token cost.
+# Model roles were chosen by a head-to-head benchmark (2026-07-11, 3 sample
+# clips, cross-judged by glm-5p1 + deepseek-v4-pro on the official rubric):
+#   Stage 1 vision  -> kimi-k2p6      (most detailed, meme-aware scene reports;
+#                                      verified hallucination-free vs real frames)
+#   Stage 2 caption -> glm-5p2        (best caption writer: 0.874 vs 0.850 qwen,
+#                                      0.830 kimi-k2p7-code, 0.666 minimax-m3)
+#   Judge/polish    -> qwen3p7-plus   (runner-up, fastest, different family from
+#                                      the writer to avoid self-preference bias)
+# minimax-m3 was dropped: it failed to emit valid JSON on 2/3 clips even with
+# response_format=json_object.
+FIREWORKS_VISION_MODEL = os.environ.get("FIREWORKS_VISION_MODEL", "accounts/fireworks/models/kimi-k2p6")
+# Used when the primary vision model fails on a clip (degrade chain).
+FIREWORKS_VISION_FALLBACK_MODEL = os.environ.get("FIREWORKS_VISION_FALLBACK_MODEL", "accounts/fireworks/models/qwen3p7-plus")
+FIREWORKS_TEXT_MODEL = os.environ.get("FIREWORKS_TEXT_MODEL", "accounts/fireworks/models/glm-5p2")
+# Frame sampling is adaptive: one frame every SECONDS_PER_FRAME, clamped to
+# [MIN_FRAMES_PER_CLIP, MAX_FRAMES_PER_CLIP]. Hidden eval clips are 30s-2min,
+# so this yields 8 frames for short clips up to 15-16 for 2-minute ones.
+MIN_FRAMES_PER_CLIP = int(os.environ.get("MIN_FRAMES_PER_CLIP", "8"))
+MAX_FRAMES_PER_CLIP = int(os.environ.get("MAX_FRAMES_PER_CLIP", "16"))
+SECONDS_PER_FRAME = float(os.environ.get("SECONDS_PER_FRAME", "8"))
+# Downscale before base64-encoding to avoid write timeouts on large resolutions.
 FIREWORKS_FRAME_MAX_WIDTH = int(os.environ.get("FIREWORKS_FRAME_MAX_WIDTH", "768"))
-# The vision call (multiple images + a 428B-param model) legitimately needs
-# more headroom than the shared PER_REQUEST_TIMEOUT_SECONDS (28s, tuned for
-# small text-only Gemma calls) — same real test above also timed out on the
-# upload itself before the frame-size fix, so this is a second, independent
-# safety margin on top of that fix, not a substitute for it.
+# Dedicated timeout for vision calls.
 FIREWORKS_VISION_TIMEOUT_SECONDS = float(os.environ.get("FIREWORKS_VISION_TIMEOUT_SECONDS", "60"))
 
-# --- Optional secondary pass: Gemma polish + self-critique via Fireworks,
-#     purely to qualify for the Best Use of Gemma bonus prize. Must never
-#     block or crash the primary submission if unavailable. ---
+# --- Optional secondary pass: judge pick-best/polish/self-critique via
+#     Fireworks. Must never block or crash the primary submission if
+#     unavailable. ---
 FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY", "")
 FIREWORKS_BASE_URL = os.environ.get("FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1")
-FIREWORKS_GEMMA_MODEL = os.environ.get("FIREWORKS_GEMMA_MODEL", "accounts/fireworks/models/gemma-3-27b-it")
+FIREWORKS_JUDGE_MODEL = os.environ.get("FIREWORKS_JUDGE_MODEL", "accounts/fireworks/models/qwen3p7-plus")
 
-# --- DEV/TEST-ONLY alternate Gemma provider (OpenRouter's free tier) ---
-# The official hackathon rule for the Best Use of Gemma bonus ($3,000 for
-# Track 2) states Gemma must be accessed "through Fireworks AI and AMD
-# Developer Cloud" for this hackathon. OpenRouter's free Gemma model is
-# useful for cheap local iteration (doesn't burn the limited $50 Fireworks
-# credit while tuning prompts), but the REAL SUBMISSION BUILD must use
-# Fireworks (the default) to remain eligible for that bonus. Never set
-# GEMMA_PROVIDER=openrouter in the Dockerfile/--build-arg for the actual
-# submission image — leave it unset (defaults to "fireworks") there.
-GEMMA_PROVIDER = os.environ.get("GEMMA_PROVIDER", "fireworks").lower()  # "fireworks" | "openrouter"
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_GEMMA_MODEL = os.environ.get("OPENROUTER_GEMMA_MODEL", "google/gemma-3-27b-it:free")
-
-ENABLE_GEMMA_POLISH = os.environ.get("ENABLE_GEMMA_POLISH", "true").lower() == "true"
+# Blanket polish is OFF by default: with Best-of-N + judge selection in
+# place, unconditionally rewriting the winning caption risks making it worse
+# or breaking the per-style word-count rules. The self-critique loop below
+# still polishes any caption the judge scores under the threshold.
+ENABLE_JUDGE_POLISH = os.environ.get("ENABLE_JUDGE_POLISH", "false").lower() == "true"
 ENABLE_SELF_CRITIQUE = os.environ.get("ENABLE_SELF_CRITIQUE", "true").lower() == "true"
+# Best-of-N candidate caption sets per clip in Stage 2 (judge picks per style).
+BEST_OF_N = int(os.environ.get("BEST_OF_N", "3"))
 MAX_CRITIQUE_RETRIES = int(os.environ.get("MAX_CRITIQUE_RETRIES", "2"))
 CRITIQUE_PASS_THRESHOLD = float(os.environ.get("CRITIQUE_PASS_THRESHOLD", "8"))
 
 # --- Orchestration / time-budget (hard rule: whole container <= 10 minutes) ---
 INPUT_PATH = os.environ.get("TASKS_INPUT_PATH", "/input/tasks.json" if os.path.exists("/input/tasks.json") else "input/tasks.json")
 OUTPUT_PATH = os.environ.get("RESULTS_OUTPUT_PATH", "/output/results.json" if os.path.exists("/output") else "output/results.json")
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "4"))
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "6"))
 # Hard limit is 600s (10 min). Leave a safety margin for the final JSON write.
 TOTAL_BUDGET_SECONDS = float(os.environ.get("TOTAL_BUDGET_SECONDS", "540"))
-# Rule: response time per request must be under 30s.
+# Per-request timeout for text (caption/judge) calls. NOT a contest rule —
+# Track 2 only caps total runtime at 10 min, with no per-request limit; this
+# is a self-chosen bound to keep any single stuck call from eating the budget.
+# (Vision calls use the longer FIREWORKS_VISION_TIMEOUT_SECONDS above.)
 PER_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("PER_REQUEST_TIMEOUT_SECONDS", "28"))
 
 # Reserved purely for writing the final results.json + process exit. If a

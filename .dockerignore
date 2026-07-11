@@ -1,0 +1,22 @@
+# Keep the Docker build context minimal — the image only needs
+# requirements.txt + src/ (see Dockerfile COPY lines). Everything else is
+# dev-only, and .env/.venv must never reach the build context.
+.git
+.gitignore
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.vscode/
+.claude/
+docs/
+output/
+scratch_videos/
+web_demo/
+submission_assets/
+input/
+README.md
+.env.example
+.dockerignore
+Dockerfile

@@ -150,7 +150,7 @@
 <div class="wrap">
   <span class="badge">AMD Developer Hackathon · Act II — Track 2</span>
   <h1>CaptionForge — Demo</h1>
-  <p class="subtitle">Paste a video URL, pick styles, and watch the 2-stage Gemini pipeline (+ optional Gemma polish) generate captions.</p>
+  <p class="subtitle">Paste a video URL, pick styles, and watch the 2-stage Fireworks pipeline generate captions.</p>
 
   <div class="panel">
     <label for="video_url">Video URL (direct .mp4 link)</label>
@@ -190,7 +190,7 @@
     <div class="meta-row" id="meta-row"></div>
     <div id="captions"></div>
     <details>
-      <summary>Scene Report (Stage 1 output — what Gemini actually saw)</summary>
+      <summary>Scene Report (Stage 1 output — what the vision model saw)</summary>
       <pre id="scene-report"></pre>
     </details>
   </div>
@@ -265,7 +265,7 @@ goBtn.addEventListener("click", async () => {
     metaRowEl.innerHTML = "";
     const pills = [
       `${data.elapsed_seconds}s total`,
-      data.gemma_available ? (data.gemma_used ? "Gemma polish applied" : "Gemma available, not used") : "Gemini-only (no FIREWORKS_API_KEY)"
+      "Fireworks-only"
     ];
     pills.forEach(p => {
       const el = document.createElement("span");

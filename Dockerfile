@@ -2,10 +2,8 @@
 # Apple Silicon: docker buildx build --platform linux/amd64 -t <tag> --push .
 FROM python:3.11-slim
 
-# ffmpeg is only used by the optional CAPTION_PROVIDER=fireworks_vision path
-# (frame extraction for fireworks_vision_client.py) — harmless/unused if the
-# default "gemini" provider stays selected, but must be present in the image
-# in case that path is ever the one selected at build/run time.
+# ffmpeg/ffprobe are required by the frame-extraction pipeline
+# (fireworks_vision_client.py).
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
@@ -26,9 +24,7 @@ WORKDIR /app/src
 # --build-arg, not supplied at `docker run` time. Never put the real key
 # literally in this file or commit it — only pass it on the build command
 # line (see README.md for the exact submission build command).
-ARG GEMINI_API_KEY=""
 ARG FIREWORKS_API_KEY=""
-ENV GEMINI_API_KEY=${GEMINI_API_KEY}
 ENV FIREWORKS_API_KEY=${FIREWORKS_API_KEY}
 
 # No CLI args: the harness runs the container, main.py reads /input/tasks.json

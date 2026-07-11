@@ -1,27 +1,19 @@
 """
-Alternate captioner: Fireworks-hosted vision model (MiniMax M3) over
-extracted still frames, instead of Gemini's native video+audio call.
+Primary captioner: Fireworks-hosted models over extracted still frames.
 
-Why this exists: the team wanted to consolidate on Fireworks (already used
-for Gemma polish/critique) instead of depending on Gemini for the primary
-scene-understanding pass. Two things were verified before writing this:
-  1. Fireworks' own chat completions docs/examples for MiniMax M3 only show
-     `image_url` content parts — no documented `video_url`/raw-video input,
-     so sending a whole video file to Fireworks is not a supported, reliable
-     path today.
-  2. Fireworks' Whisper/audio-transcription endpoints
-     (audio-prod/audio-turbo.api.fireworks.ai) were confirmed discontinued
-     as of 2026-06-10 (return 401 regardless of payload) — so there is no
-     way to recover audio understanding on this path either.
+Two-stage pipeline, frames-only (no audio — Fireworks' Whisper endpoints
+were confirmed discontinued as of 2026-06-10):
+  Stage 1: adaptive frame sampling -> vision model (kimi-k2p6, benchmark
+           winner for scene reports) -> structured 10-section Scene Report.
+           Degrade chain on failure: fewer frames -> fallback vision model
+           (qwen3p7-plus) so one flaky call never costs the whole clip.
+  Stage 2: Best-of-N — the text model (glm-5p2, benchmark winner for
+           caption writing) generates N candidate caption sets in parallel
+           at different temperatures; main.py has the judge model pick the
+           best per style.
 
-Net effect: this path is frames-only, no audio. It trades away Gemini's
-native audio understanding (speech/music/ambient sound) for running
-entirely on Fireworks. Selected via config.CAPTION_PROVIDER=fireworks_vision
-(default remains "gemini" — this path is opt-in, not the safe default).
-
-Interface matches gemini_client.GeminiCaptioner exactly
-(caption_clip(video_path, styles) -> (captions: dict, scene_report: str)) so
-main.py only needs a small factory branch, not a rewrite.
+caption_clip(video_path, styles) -> (candidates: list[dict], scene_report)
+where candidates is a non-empty list of {style: caption} dicts.
 """
 import base64
 import json
@@ -30,6 +22,8 @@ import subprocess
 import tempfile
 import time
 import os
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -53,14 +47,19 @@ class SceneAnalysisFailed(Exception):
 
 
 def _probe_duration_seconds(video_path: str) -> float:
+    t0 = time.monotonic()
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", video_path],
         capture_output=True, text=True, timeout=30,
     )
+    elapsed = time.monotonic() - t0
     try:
-        return max(float(out.stdout.strip()), 0.1)
-    except (ValueError, AttributeError):
+        duration = max(float(out.stdout.strip()), 0.1)
+        print(f"[ffmpeg] Probed video duration: {duration:.2f}s (took {elapsed:.2f}s)")
+        return duration
+    except (ValueError, AttributeError) as e:
+        print(f"[ffmpeg] Probed duration failed (took {elapsed:.2f}s): {e} (using 10s fallback)")
         return 10.0  # unknown duration fallback — still try to grab a few frames
 
 
@@ -94,28 +93,51 @@ def _extract_frames(video_path: str, max_frames: int, workdir: str):
     # divisible by 2, which some encoders require).
     scale_filter = f"scale='min({max_w},iw)':-2"
 
+    print(f"[ffmpeg] Extracting up to {max_frames} frames from {os.path.basename(video_path)}...")
+    t0 = time.monotonic()
     frames = []
     for i, ts in enumerate(timestamps):
         out_path = os.path.join(workdir, f"frame_{i:03d}.jpg")
         result = subprocess.run(
             ["ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", video_path,
-             "-frames:v", "1", "-vf", scale_filter, "-q:v", "4", out_path],
+             "-frames:v", "1", "-vf", scale_filter, "-pix_fmt", "yuvj420p", "-strict", "-2", "-q:v", "4", out_path],
             capture_output=True, timeout=30,
         )
         if result.returncode == 0 and os.path.exists(out_path):
             with open(out_path, "rb") as f:
                 frames.append((ts, f.read()))
+        else:
+            print(f"[ffmpeg] Warning: failed to extract frame {i} at timestamp {ts:.2f}s: {result.stderr.decode(errors='replace')}")
 
+    elapsed = time.monotonic() - t0
+    print(f"[ffmpeg] Extracted {len(frames)} frames successfully in {elapsed:.2f}s")
     if not frames:
         raise RuntimeError("ffmpeg failed to extract any frames from this clip")
     return frames
 
 
 def _extract_json(text: str) -> dict:
+    """Robust JSON extraction. Handles plain JSON, JSON with trailing junk
+    ("Extra data" — some models emit two objects or commentary after the
+    JSON even in json_object mode), a top-level JSON array (falls through to
+    grab the first embedded object), and JSON embedded in surrounding prose."""
     try:
-        return json.loads(text)
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+        # Parsed fine but isn't an object (e.g. a top-level array/string) —
+        # fall through to the object-extraction branches below.
     except json.JSONDecodeError:
         pass
+    # Find the first '{' and raw_decode from there — tolerates trailing junk.
+    start = text.find("{")
+    if start != -1:
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(text[start:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
@@ -126,8 +148,8 @@ def _extract_json(text: str) -> dict:
 
 
 class FireworksCaptioner:
-    def __init__(self, api_key: str = None, base_url: str = None,
-                 vision_model: str = None, text_model: str = None):
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None,
+                 vision_model: Optional[str] = None, text_model: Optional[str] = None):
         self.api_key = api_key or config.FIREWORKS_API_KEY
         if not self.api_key:
             raise ValueError("Missing FIREWORKS_API_KEY (required for CAPTION_PROVIDER=fireworks_vision)")
@@ -135,20 +157,25 @@ class FireworksCaptioner:
         self.vision_model = vision_model or config.FIREWORKS_VISION_MODEL
         self.text_model = text_model or config.FIREWORKS_TEXT_MODEL
 
-    def _chat_with_retry(self, messages: list, model: str, max_tokens: int = 1500,
-                          response_format: dict = None, timeout_seconds: float = None):
+    def _chat_with_retry(self, messages: List[Dict[str, Any]], model: str, max_tokens: int = 1500,
+                          response_format: Optional[Dict[str, Any]] = None, timeout_seconds: Optional[float] = None,
+                          temperature: float = 0.5):
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        payload = {
+        payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.5,
+            "temperature": temperature,
+            # All models in our benchmark accept this and it keeps chain-of-
+            # thought out of `content` (kimi models otherwise leak reasoning
+            # text into the answer) while cutting latency roughly in half.
+            "reasoning_effort": "none",
         }
         if response_format:
             payload["response_format"] = response_format
         timeout = timeout_seconds if timeout_seconds is not None else config.PER_REQUEST_TIMEOUT_SECONDS
 
-        last_exc = None
+        last_exc: Optional[Exception] = None
         for attempt in range(MAX_API_RETRIES + 1):
             try:
                 resp = requests.post(
@@ -167,49 +194,105 @@ class FireworksCaptioner:
                     time.sleep(delay)
                     continue
                 raise
+        assert last_exc is not None
         raise last_exc
 
-    def caption_clip(self, video_path: str, styles: list, max_wait_seconds: int = 90):
-        """Frames-only equivalent of GeminiCaptioner.caption_clip. Same
-        return contract: (captions: dict, scene_report: str)."""
-        with tempfile.TemporaryDirectory() as workdir:
-            frames = _extract_frames(video_path, config.MAX_FRAMES_PER_CLIP, workdir)
-            duration = _probe_duration_seconds(video_path)
+    def _scene_report(self, frames, duration: float, filename: str, model: str) -> str:
+        timestamps = [ts for ts, _ in frames]
+        prompt_text = build_frame_scene_analysis_prompt(timestamps, duration)
 
-            timestamps = [ts for ts, _ in frames]
-            prompt_text = build_frame_scene_analysis_prompt(timestamps, duration)
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+        for _, jpeg_bytes in frames:
+            b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            })
 
-            content = [{"type": "text", "text": prompt_text}]
-            for ts, jpeg_bytes in frames:
-                b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                })
-
-            # Dedicated (longer) timeout: multiple images + a large vision
-            # model legitimately need more than the shared 28s used for
-            # small text-only Gemma calls elsewhere — see config.py comment.
-            scene_report = self._chat_with_retry(
-                messages=[{"role": "user", "content": content}],
-                model=self.vision_model,
-                max_tokens=1200,
-                timeout_seconds=config.FIREWORKS_VISION_TIMEOUT_SECONDS,
-            )
-
+        print(f"[fireworks] Sending Scene Analysis request for {filename} to {model}...")
+        t0 = time.monotonic()
+        scene_report = self._chat_with_retry(
+            messages=[{"role": "user", "content": content}],
+            model=model,
+            max_tokens=1200,
+            timeout_seconds=config.FIREWORKS_VISION_TIMEOUT_SECONDS,
+        )
+        print(f"[fireworks] Scene Analysis completed in {time.monotonic() - t0:.2f}s")
         if scene_report.upper().startswith("ANALYSIS FAILED"):
             raise SceneAnalysisFailed(scene_report)
+        return scene_report
 
-        # --- Stage 2: caption generation, text-only, from the report ---
-        # Same prompt builder as the Gemini path — it's already model-agnostic.
+    def _generate_candidates(self, scene_report: str, styles: list, filename: str, n: int) -> list:
+        """Stage 2 Best-of-N: n candidate caption sets in parallel at
+        different temperatures. Returns every set that parsed successfully
+        (at least one, else raises the last error)."""
         prompt2 = build_caption_generation_prompt(scene_report, styles)
-        raw = self._chat_with_retry(
-            messages=[{"role": "user", "content": prompt2}],
-            model=self.text_model,
-            max_tokens=600,
-            response_format={"type": "json_object"},
-        )
+        temperatures = [0.6, 0.85, 1.0][:max(1, n)] or [0.7]
 
-        captions = _extract_json(raw)
-        result = {s: str(captions.get(s, "")).strip() for s in styles}
-        return result, scene_report
+        def one(temp: float):
+            raw = self._chat_with_retry(
+                messages=[{"role": "user", "content": prompt2}],
+                model=self.text_model,
+                max_tokens=600,
+                response_format={"type": "json_object"},
+                temperature=temp,
+            )
+            captions = _extract_json(raw)
+            return {s: str(captions.get(s, "")).strip() for s in styles}
+
+        print(f"[fireworks] Generating {len(temperatures)} caption candidate set(s) for {filename} via {self.text_model}...")
+        t0 = time.monotonic()
+        candidates, last_exc = [], None
+        with ThreadPoolExecutor(max_workers=len(temperatures)) as pool:
+            futures = [pool.submit(one, t) for t in temperatures]
+            for f in futures:
+                try:
+                    cand = f.result()
+                    if any(cand.get(s) for s in styles):
+                        candidates.append(cand)
+                except Exception as e:
+                    last_exc = e
+                    print(f"[fireworks] one caption candidate failed (tolerated): {e}")
+        print(f"[fireworks] Caption Generation completed in {time.monotonic() - t0:.2f}s "
+              f"({len(candidates)}/{len(temperatures)} candidates OK)")
+        if not candidates:
+            raise last_exc or RuntimeError("all caption candidates failed")
+        return candidates
+
+    def caption_clip(self, video_path: str, styles: list):
+        """Returns (candidates: list[dict], scene_report: str). Candidates
+        is a non-empty list of {style: caption} dicts — the caller picks the
+        best one per style (or just uses candidates[0]).
+
+        Degrade chain for Stage 1 so a flaky model/call never costs the
+        whole clip: full frames on the primary vision model -> 4 frames on
+        the primary -> 4 frames on the fallback vision model."""
+        filename = os.path.basename(video_path)
+        with tempfile.TemporaryDirectory() as workdir:
+            duration = _probe_duration_seconds(video_path)
+            # Adaptive sampling: 1 frame per SECONDS_PER_FRAME, clamped.
+            n_frames = max(config.MIN_FRAMES_PER_CLIP,
+                           min(config.MAX_FRAMES_PER_CLIP, round(duration / config.SECONDS_PER_FRAME)))
+            frames = _extract_frames(video_path, n_frames, workdir)
+
+            attempts = [
+                (frames, self.vision_model),
+                (frames[:: max(1, len(frames) // 4)][:4], self.vision_model),
+                (frames[:: max(1, len(frames) // 4)][:4], config.FIREWORKS_VISION_FALLBACK_MODEL),
+            ]
+            scene_report, last_exc = None, None
+            for i, (attempt_frames, model) in enumerate(attempts):
+                try:
+                    scene_report = self._scene_report(attempt_frames, duration, filename, model)
+                    break
+                except SceneAnalysisFailed:
+                    raise  # model explicitly says frames are unreadable — don't burn time retrying
+                except Exception as e:
+                    last_exc = e
+                    if i < len(attempts) - 1:
+                        print(f"[fireworks] Scene Analysis attempt {i + 1} failed ({e}) — degrading")
+            if scene_report is None:
+                raise last_exc or RuntimeError("scene analysis failed")
+
+        candidates = self._generate_candidates(scene_report, styles, filename, config.BEST_OF_N)
+        return candidates, scene_report

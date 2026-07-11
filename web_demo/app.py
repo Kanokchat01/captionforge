@@ -10,7 +10,7 @@ click a button, and see the 4 generated captions rendered nicely instead of
 hand-editing input/tasks.json and rereading output/results.json every time.
 
 It reuses the exact same pipeline code the submission uses
-(gemini_client.GeminiCaptioner, gemma_polish.GemmaAssistant, downloader.py,
+(fireworks_vision_client.FireworksCaptioner, judge_polish.JudgeAssistant, downloader.py,
 config.py) so results shown here should match what the real container would
 produce for the same clip.
 
@@ -19,8 +19,7 @@ Run locally:
     python web_demo/app.py
 Then open http://localhost:5000 in a browser.
 
-Needs the same .env as the main pipeline (GEMINI_API_KEY required,
-FIREWORKS_API_KEY optional for Gemma polish/critique).
+Needs the same .env as the main pipeline (FIREWORKS_API_KEY required).
 """
 import os
 import sys
@@ -36,28 +35,29 @@ from flask import Flask, request, jsonify, render_template
 
 import config
 from downloader import download_video
-from gemini_client import GeminiCaptioner, SceneAnalysisFailed
-from gemma_polish import GemmaAssistant
+from fireworks_vision_client import FireworksCaptioner, SceneAnalysisFailed as FireworksSceneAnalysisFailed
+from judge_polish import JudgeAssistant
+from prompts import in_word_range, word_count
 
 app = Flask(__name__)
 
 ALL_STYLES = ["formal", "sarcastic", "humorous_tech", "humorous_non_tech"]
 HUMOR_STYLES_FOR_POLISH = {"sarcastic", "humorous_tech", "humorous_non_tech"}
 
-_gemini = None
-_gemma = None
+_captioner = None
+_judge = None
 
 
 def get_clients():
-    """Lazy singleton init so a missing GEMINI_API_KEY surfaces as a clean
+    """Lazy singleton init so missing API keys surface as a clean
     JSON error on first request instead of crashing the server at import
     time (the server itself should stay up even if keys aren't set yet)."""
-    global _gemini, _gemma
-    if _gemini is None:
-        _gemini = GeminiCaptioner()
-    if _gemma is None:
-        _gemma = GemmaAssistant()
-    return _gemini, _gemma
+    global _captioner, _judge
+    if _captioner is None:
+        _captioner = FireworksCaptioner()
+    if _judge is None:
+        _judge = JudgeAssistant()
+    return _captioner, _judge
 
 
 @app.route("/")
@@ -76,7 +76,7 @@ def generate():
         return jsonify({"error": "Please provide a video URL."}), 400
 
     try:
-        gemini, gemma = get_clients()
+        captioner, judge = get_clients()
     except ValueError as e:
         return jsonify({"error": f"Server is missing an API key: {e}"}), 500
 
@@ -86,27 +86,46 @@ def generate():
         local_path = download_video(video_url)
 
         try:
-            base_captions, scene = gemini.caption_clip(local_path, styles)
-        except SceneAnalysisFailed as e:
-            return jsonify({"error": f"Gemini could not analyze this clip: {e}"}), 422
+            candidates, scene = captioner.caption_clip(local_path, styles)
+        except FireworksSceneAnalysisFailed as e:
+            return jsonify({"error": f"Captioner could not analyze this clip: {e}"}), 422
+
+        def polish_with_word_guard(style, scene_hint, prompt_caption, baseline):
+            # Same guard as main.py: revert a polish that pushes an in-range
+            # caption out of its style's word-count range.
+            polished = judge.polish(style, scene_hint, prompt_caption)
+            if polished != baseline and in_word_range(style, baseline) and not in_word_range(style, polished):
+                print(f"[word-guard] {style}: polish went out of range "
+                      f"({word_count(baseline)} -> {word_count(polished)} words) — keeping previous caption")
+                return baseline
+            return polished
 
         final_captions = {}
-        gemma_used_any = False
-        for style, caption in base_captions.items():
+        judge_used_any = False
+        for style in styles:
+            style_options = [c.get(style, "") for c in candidates if c.get(style)]
+            # Prefer word-count-compliant candidates (same as main.py).
+            compliant = [o for o in style_options if in_word_range(style, o)]
+            pick_pool = compliant or style_options
+            if judge.available:
+                caption = judge.pick_best(style, scene, pick_pool)
+                judge_used_any = judge_used_any or len(pick_pool) > 1
+            else:
+                caption = next(iter(pick_pool), "")
             result = caption
 
-            if config.ENABLE_GEMMA_POLISH and gemma.available and style in HUMOR_STYLES_FOR_POLISH:
-                result = gemma.polish(style, scene, result)
-                gemma_used_any = True
+            if config.ENABLE_JUDGE_POLISH and judge.available and style in HUMOR_STYLES_FOR_POLISH:
+                result = polish_with_word_guard(style, scene, result, result)
+                judge_used_any = True
 
-            if config.ENABLE_SELF_CRITIQUE and gemma.available:
+            if config.ENABLE_SELF_CRITIQUE and judge.available:
                 for _ in range(config.MAX_CRITIQUE_RETRIES):
-                    score, feedback = gemma.judge(style, scene, result)
-                    gemma_used_any = True
+                    score, feedback = judge.judge(style, scene, result)
+                    judge_used_any = True
                     if score >= config.CRITIQUE_PASS_THRESHOLD:
                         break
                     hint = f"{result} (reviewer feedback to address: {feedback})" if feedback else result
-                    result = gemma.polish(style, scene, hint)
+                    result = polish_with_word_guard(style, scene, hint, result)
 
             final_captions[style] = result or caption
 
@@ -114,8 +133,8 @@ def generate():
         return jsonify({
             "captions": final_captions,
             "scene_report": scene,
-            "gemma_available": gemma.available,
-            "gemma_used": gemma_used_any,
+            "judge_available": judge.available,
+            "judge_used": judge_used_any,
             "elapsed_seconds": round(elapsed, 1),
         })
 
