@@ -213,7 +213,12 @@ def generate():
 
 
 if __name__ == "__main__":
+    # Local dev only. In a container the entrypoint is gunicorn (Dockerfile.web),
+    # which imports `app` directly and never runs this block.
     if not config.FIREWORKS_API_KEY:
         print("[!] FIREWORKS_API_KEY is not set — the UI will load but generation will fail.")
-    print("[*] CaptionForge demo running at http://localhost:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    port = int(os.environ.get("PORT", "5000"))
+    # 0.0.0.0 so the app is reachable when run inside a container.
+    host = os.environ.get("HOST", "127.0.0.1")
+    print(f"[*] CaptionForge demo running at http://localhost:{port}")
+    app.run(host=host, port=port, debug=False, threaded=True)
