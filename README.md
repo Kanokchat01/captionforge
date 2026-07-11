@@ -197,5 +197,7 @@ reach the image).
 - `src/prompts.py` — all prompt text, style rules, judge rubrics, accuracy safeguards
 - `src/downloader.py` — clip download with retry/timeout/wall-cap + size probing
 - `src/config.py` — all tunables, env-var driven, benchmark notes
-- `web_demo/` — local Flask demo with live-progress streaming UI (not part of the submission)
-- `docs/` — Participant Guide, design notes, and pipeline-change history
+- `web_demo/` — Flask demo with live-progress streaming UI (not part of the submission)
+- `Dockerfile` — the Track 2 submission image (headless, key baked at build time)
+- `Dockerfile.web` — the hosted demo image (web server, key supplied at run time)
+- `docs/` — the official Participant Guide
