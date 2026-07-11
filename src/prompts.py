@@ -52,21 +52,37 @@ STYLE_RULES = {
         'FORMAL (25-35 words): Professional, factual, objective. Use clear '
         'simple English a news anchor would say. No slang. No emojis. Do '
         'not start with "The scene shows" or "The video captures." Do not '
-        'end with a generic summary sentence.'
+        'end with a generic summary sentence. Describe the setting generically '
+        '(e.g. "an urban street," "a modern office") — never name a specific '
+        'real-world city, country, or landmark unless it is explicitly written '
+        'in the report as confirmed by legible on-screen text. Describe only '
+        'visible effects (e.g. "streaks of light from moving traffic") — never '
+        'name the photographic technique or equipment behind them (e.g. do not '
+        'say "long exposure," "drone shot," "time-lapse").'
     ),
     "sarcastic": (
-        'SARCASTIC (15-25 words): Write like texting a friend. Short '
-        'sentences only, subject-verb-object order (e.g. "The kitten '
-        'pounces" not "Pouncing is what the kitten does"). Never start with '
-        '"Truly", "Such", "Witnessing", or "Behold". Actually mock '
-        'something specific in the video. Use slang naturally (main '
-        'character energy, aura points, cooked). End with a punchline + 1 '
-        'emoji.'
+        'SARCASTIC (15-25 words): Dry, deadpan, ironic — understate rather '
+        'than hype. Short, flat sentences only, subject-verb-object order '
+        '(e.g. "The kitten pounces" not "Pouncing is what the kitten does"). '
+        'Never start with "Truly", "Such", "Witnessing", or "Behold". '
+        'Actually mock something specific and concrete in the video — the '
+        'irony comes from the flat, matter-of-fact delivery of an absurd or '
+        'mundane observation, not from hype or exclamation. Avoid loud '
+        'Gen-Z hype slang (e.g. do not force in "main character energy," '
+        '"aura points," "cooked," "no cap," "rent free") — a light touch of '
+        'contemporary phrasing is fine only if it stays understated, never '
+        'as the whole joke. End with a dry, lightly mocking punchline; add '
+        '1 emoji only if it stays restrained rather than making the line '
+        'feel hyped.'
     ),
     "humorous_tech": (
         'HUMOROUS_TECH (15-25 words): Pick ONE tech concept and connect it '
-        'to what is actually happening in the video. Do not list multiple '
-        'tech concepts. Punchy, one core joke. 1 emoji.'
+        'to what is actually happening in the video. The joke MUST explicitly '
+        'name the specific subject, object, or action from the KEY ACTIONS or '
+        'STANDOUT DETAILS sections (e.g. the actual animal, vehicle, or person '
+        'and what it is doing) — a tech pun that never mentions anything '
+        'specific to this clip and could be pasted onto any video is a FAIL. '
+        'Do not list multiple tech concepts. Punchy, one core joke. 1 emoji.'
     ),
     "humorous_non_tech": (
         'HUMOROUS_NON_TECH (15-25 words): Rotated openings. Start strictly with '
@@ -110,17 +126,19 @@ Write your report in the following 10 sections:
 
 1. SUBJECT
 Who or what is the main focus? Describe appearance in detail (species, color, size, clothing, expression, distinguishing features).
+When describing eyes/gaze, report only what is directly visible. If the eyes are lowered, downcast, shadowed, or not clearly wide open, describe it as "looking down" or "gaze directed at [whatever is in front of them]" — do NOT assert the eyes are closed or that the subject is drowsy, sleeping, or dozing off. While a subject is actively doing a task (typing, reading, eating, working), lowered or hidden eyes almost always mean the gaze is aimed at that task, not that the eyes are shut. Only state the eyes are closed if a frame shows both eyelids unmistakably and fully shut with no task-directed gaze possible.
 
 2. ENVIRONMENT
-Where does this take place? Describe the setting, surfaces, objects, background elements, weather, and time of day.
+Where does this take place? Describe the setting, surfaces, objects, background elements, weather, and time of day. Describe the TYPE of place generically (e.g. "a multi-lane urban street," "an office with desks and computer monitors"). Do NOT name a specific real-world city, country, neighborhood, or landmark unless it is explicitly, legibly written on a sign or screen in the frames — guessing a location from general visual style (architecture, plant species, signage style) is exactly the kind of unconfirmed claim that must NOT appear here.
 
 3. KEY ACTIONS (timeline)
 List what changes across the sampled frames, chronologically, using the frame timestamps given above.
 Format: [MM:SS] Action/description at that frame.
 Example: [00:03] A kitten sits behind leafy branches, looking at the camera.
+Describe only the state actually visible in each sampled frame. Do not narrate a smooth or gradual transition that you are inferring to connect the frames (e.g. "slowly closes her eyes," "gradually speeds up," "begins to tire," "starts to fall asleep") — if the sampled frames do not unambiguously show that progression, report each frame's state on its own and leave what happens between them as unknown.
 
 4. CAMERA & FRAMING
-Describe the camera angle (low, high, eye-level) and framing (close-up, wide shot, depth of field) as seen across the frames. Only describe movement (pan/tilt/tracking) if it can be confidently inferred from how framing changes between frames — otherwise say "static or unknown."
+Describe the camera angle (low, high, eye-level) and framing (close-up, wide shot, depth of field) as seen across the frames. Only describe movement (pan/tilt/tracking) if it can be confidently inferred from how framing changes between frames — otherwise say "static or unknown." Describe only what is visibly evident (e.g. "vehicle lights appear as streaks," "background is blurred"). Do NOT name the specific photographic technique or equipment that supposedly produced it (e.g. "long exposure," "drone shot," "time-lapse," "macro lens," "slow motion") — naming a capture technique is a guess about how the footage was made, not an observation of what is shown.
 
 5. LIGHTING & COLOR
 Describe the dominant light source, color palette, contrast, and any notable visual effects (lens flare, bokeh, golden hour glow, neon).
@@ -140,16 +158,17 @@ What is naturally funny, ironic, cute, dramatic, or absurd about this video? Thi
 Base this only on what is visually confirmed in sections 1-5 — not on assumed intent, thoughts, or emotions the subject cannot literally express. If a subject "looks annoyed," describe the visible expression, don't assert the subject IS annoyed.
 
 10. RISKS (things NOT confirmed)
-List anything a caption writer might assume or hallucinate that is NOT actually shown across the sampled frames, including anything that might have happened in the gaps between frames, and note that no audio was available.
-Example: "No butterflies visible. No other animals. No human hands shown. No audio track analyzed."
+List anything a caption writer might assume or hallucinate that is NOT actually shown across the sampled frames, including anything that might have happened in the gaps between frames, any specific real-world location/city/landmark name that was NOT confirmed by legible on-screen text, any specific photographic technique or equipment that was NOT confirmed, any on-screen text/signage that appeared anywhere in the frames but was NOT 100% clearly legible (move it here instead of quoting it elsewhere, and describe it generically there too), and note that no audio was available.
+Example: "No butterflies visible. No other animals. No human hands shown. No audio track analyzed. City/location not identifiable from the frames. Capture technique (e.g. exposure settings) not identifiable from the frames. Background building signage is present but too small/distant to read with certainty — do not quote it."
 
 --- END REPORT ---
 
 Important:
 - Be specific, not generic. "Orange tabby kitten" not just "a cat."
 - Describe what you actually SEE in these specific frames, not what you assume happens between them.
+- Do not upgrade an ambiguous pose into a definite action or inner state — describe the literal, observable position instead. A lowered head or downward gaze is "looking down," NOT "eyes closing" or "falling asleep"; a crouched animal is "crouched low," NOT necessarily "about to pounce"; dark clouds are "dark clouds," NOT necessarily "an incoming storm"; a runner mid-step is "mid-stride," NOT necessarily "tiring." Only make the stronger claim if a frame shows it beyond any doubt.
 - If unsure about something, say "possibly" or "appears to be." Anything marked this way should be treated as unconfirmed, not fact.
-- On-screen text (signs, labels, screens): transcribe it ONLY if it is clearly legible in the frames. If it is small, blurry, or partially visible, describe it generically ("a storefront sign", "text on the screen") instead of guessing the exact words — a misread sign quoted in a caption is worse than no sign at all.
+- On-screen text (signs, labels, screens): the bar for "clearly legible" is very high — every single letter must be sharp, large, high-contrast, and unmistakable, with zero doubt about any character. In wide shots, distant background signage, small building signs among many others, or anything even slightly blurred, angled, small, or partially occluded, you do NOT have enough information — describe it generically instead ("a building sign", "storefront signage", "illuminated signage in the background") and do NOT quote, paraphrase, or partially reconstruct the wording. If you are not 100% certain of every single word, treat the ENTIRE sign as illegible — never transcribe part of it and guess the rest, and never "clean up" a fuzzy read into a plausible-sounding phrase. A misread sign quoted in a caption directly costs accuracy points and is always worse than a generic description, even if the generic version sounds less impressive.
 """
 
 
@@ -164,10 +183,22 @@ Rules:
 - No questions, no hashtags, no call-to-action, no markdown.
 - Before finalizing, count the words in each caption and confirm it fits the required range for that style.
 
-Grounding: Every claim must come from the video analysis report above. Check the RISKS section of the report — do not include anything flagged there as uncertain or unconfirmed.
+Grounding: Every claim must come from the video analysis report above. Check the RISKS section of the report — do not include anything flagged there as uncertain or unconfirmed. Never put specific sign/label/screen text in quotes unless the report explicitly states it was clearly and confidently legible — if the report only mentions signage generically (e.g. "a building sign"), your caption must also stay generic and must not invent specific wording for it.
 
 BANNED WORDS (never use — they sound like AI):
 thoroughfare, bustling, captivating, witnessing, observing, commences, showcases, delves, furthermore, utilizing, vibrant, pivotal, intricate, landscape, tapestry, multifaceted, underscores, endeavor, realm
+
+WRONG vs RIGHT FOR SARCASTIC (Dry and Deadpan, Not Hype Slang):
+❌ "The kitten struts in dripping with main character energy, aura points maxed, we are so cooked 😭" — loud hype slang, not dry
+✅ "The kitten struts past like it owns the place. It does not. 😐" — flat, deadpan, ironic
+❌ "Traffic is absolutely giving main character syndrome right now, no cap 💀" — hype-speak, not mockery
+✅ "Traffic barely moves. Everyone still drives like they're late for something important. 🙄" — dry observation, lightly mocking
+
+WRONG vs RIGHT FOR FORMAL (Never Guess Location or Camera Technique):
+❌ "A congested road in Seoul's Guro district" — naming an unconfirmed real city/district
+✅ "A congested multi-lane urban street" — describe the setting generically instead
+❌ "Long exposure photography turns traffic into streaks of light" — naming an unconfirmed capture technique
+✅ "Passing traffic appears as streaks of light in the frame" — describe only the visible effect
 
 WRONG vs RIGHT FOR HUMOROUS_NON_TECH (Dynamic Scenarios Based on Domain):
 ❌ "POV: When you get stuck in the bustling urban grid during rush hour"

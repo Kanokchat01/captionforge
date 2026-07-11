@@ -1,57 +1,70 @@
 """
 Local web demo for CaptionForge.
 
-This is NOT part of the Track 2 submission itself -- the real submission
-runs headless inside Docker (see ../src/main.py, reads /input/tasks.json,
-writes /output/results.json, no UI at all). This Flask app exists purely as
-a convenience for trying the pipeline interactively during development and
-for recording the hackathon demo video: paste a video URL, pick styles,
-click a button, and see the 4 generated captions rendered nicely instead of
-hand-editing input/tasks.json and rereading output/results.json every time.
+NOT part of the Track 2 submission -- the real submission runs headless in
+Docker (see ../src/main.py: reads /input/tasks.json, writes
+/output/results.json, no UI). This Flask app exists to try the pipeline
+interactively during development and to record the hackathon demo video.
 
 It reuses the exact same pipeline code the submission uses
-(fireworks_vision_client.FireworksCaptioner, judge_polish.JudgeAssistant, downloader.py,
-config.py) so results shown here should match what the real container would
-produce for the same clip.
+(fireworks_vision_client.FireworksCaptioner, judge_polish.JudgeAssistant,
+downloader.py, config.py, prompts.py) -- including the same Best-of-N
+selection, word-count guard, and self-critique loop -- so what you see here
+matches what the judged container would produce for the same clip.
+
+/api/generate streams newline-delimited JSON (NDJSON) so the UI can show real
+pipeline progress instead of a spinner: the clip takes 20-90s to process.
 
 Run locally:
     pip install -r web_demo/requirements.txt
     python web_demo/app.py
-Then open http://localhost:5000 in a browser.
+Then open http://localhost:5000
 
 Needs the same .env as the main pipeline (FIREWORKS_API_KEY required).
 """
+import json
 import os
 import sys
 import time
 import traceback
+from typing import Iterator
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, Response, request, jsonify, render_template
 
 import config
 from downloader import download_video
-from fireworks_vision_client import FireworksCaptioner, SceneAnalysisFailed as FireworksSceneAnalysisFailed
+from fireworks_vision_client import FireworksCaptioner, SceneAnalysisFailed
 from judge_polish import JudgeAssistant
-from prompts import in_word_range, word_count
+from prompts import STYLE_WORD_RANGES, in_word_range, word_count
 
 app = Flask(__name__)
 
 ALL_STYLES = ["formal", "sarcastic", "humorous_tech", "humorous_non_tech"]
 HUMOR_STYLES_FOR_POLISH = {"sarcastic", "humorous_tech", "humorous_non_tech"}
 
+# The three official example clips from the Participant Guide, offered as
+# one-click presets so the demo doesn't require hunting for a URL.
+EXAMPLE_CLIPS = [
+    {"label": "Urban autumn boulevard",
+     "url": "https://storage.googleapis.com/amd-hackathon-clips/1860079-uhd_2560_1440_25fps.mp4"},
+    {"label": "Kitten in a garden",
+     "url": "https://storage.googleapis.com/amd-hackathon-clips/13825391-uhd_3840_2160_30fps.mp4"},
+    {"label": "Office worker at a desk",
+     "url": "https://storage.googleapis.com/amd-hackathon-clips/3044693-uhd_3840_2160_24fps.mp4"},
+]
+
 _captioner = None
 _judge = None
 
 
 def get_clients():
-    """Lazy singleton init so missing API keys surface as a clean
-    JSON error on first request instead of crashing the server at import
-    time (the server itself should stay up even if keys aren't set yet)."""
+    """Lazy singleton init so a missing API key surfaces as a clean error on
+    the first request instead of killing the server at import time."""
     global _captioner, _judge
     if _captioner is None:
         _captioner = FireworksCaptioner()
@@ -60,96 +73,147 @@ def get_clients():
     return _captioner, _judge
 
 
+def ndjson(event: str, **payload) -> str:
+    """One newline-delimited JSON event for the streaming response."""
+    return json.dumps({"event": event, **payload}, ensure_ascii=False) + "\n"
+
+
+def caption_meta(style: str, text: str) -> dict:
+    """Word-count compliance info shown per caption in the UI — the same
+    check the pipeline's word-count guard applies internally."""
+    lo, hi = STYLE_WORD_RANGES.get(style, (15, 25))
+    return {
+        "words": word_count(text),
+        "min_words": lo,
+        "max_words": hi,
+        "in_range": in_word_range(style, text),
+    }
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        examples=EXAMPLE_CLIPS,
+        models={
+            "vision": config.FIREWORKS_VISION_MODEL.rsplit("/", 1)[-1],
+            "text": config.FIREWORKS_TEXT_MODEL.rsplit("/", 1)[-1],
+            "judge": config.FIREWORKS_JUDGE_MODEL.rsplit("/", 1)[-1],
+        },
+        best_of_n=config.BEST_OF_N,
+    )
+
+
+@app.route("/api/health")
+def health():
+    """Lets the UI warn about a missing key before the user waits 90s."""
+    return jsonify({
+        "api_key_set": bool(config.FIREWORKS_API_KEY),
+        "self_critique": config.ENABLE_SELF_CRITIQUE,
+        "best_of_n": config.BEST_OF_N,
+    })
 
 
 @app.route("/api/generate", methods=["POST"])
 def generate():
     data = request.get_json(force=True, silent=True) or {}
     video_url = (data.get("video_url") or "").strip()
-    requested_styles = data.get("styles") or ALL_STYLES
-    styles = [s for s in requested_styles if s in ALL_STYLES] or ALL_STYLES
+    requested = data.get("styles") or ALL_STYLES
+    styles = [s for s in ALL_STYLES if s in requested] or ALL_STYLES
 
     if not video_url:
         return jsonify({"error": "Please provide a video URL."}), 400
+    if not config.FIREWORKS_API_KEY:
+        return jsonify({"error": "FIREWORKS_API_KEY is not set. Add it to your .env file."}), 500
 
-    try:
-        captioner, judge = get_clients()
-    except ValueError as e:
-        return jsonify({"error": f"Server is missing an API key: {e}"}), 500
-
-    local_path = None
-    t0 = time.monotonic()
-    try:
-        local_path = download_video(video_url)
-
+    def stream() -> Iterator[str]:
+        local_path = None
+        t0 = time.monotonic()
         try:
+            captioner, judge = get_clients()
+
+            # --- Stage 1: download -------------------------------------
+            yield ndjson("stage", id="download", status="active")
+            local_path = download_video(video_url)
+            size_mb = os.path.getsize(local_path) / (1024 * 1024)
+            yield ndjson("stage", id="download", status="done", detail=f"{size_mb:.1f} MB")
+
+            # --- Stage 2: frames -> scene report -> Best-of-N -----------
+            yield ndjson("stage", id="analyze", status="active")
             candidates, scene = captioner.caption_clip(local_path, styles)
-        except FireworksSceneAnalysisFailed as e:
-            return jsonify({"error": f"Captioner could not analyze this clip: {e}"}), 422
+            yield ndjson("stage", id="analyze", status="done",
+                         detail=f"{len(candidates)} candidate set(s)")
+            yield ndjson("scene", report=scene)
 
-        def polish_with_word_guard(style, scene_hint, prompt_caption, baseline):
-            # Same guard as main.py: revert a polish that pushes an in-range
-            # caption out of its style's word-count range.
-            polished = judge.polish(style, scene_hint, prompt_caption)
-            if polished != baseline and in_word_range(style, baseline) and not in_word_range(style, polished):
-                print(f"[word-guard] {style}: polish went out of range "
-                      f"({word_count(baseline)} -> {word_count(polished)} words) — keeping previous caption")
-                return baseline
-            return polished
+            # --- Stage 3: judge picks best, then self-critiques ---------
+            yield ndjson("stage", id="judge", status="active")
 
-        final_captions = {}
-        judge_used_any = False
-        for style in styles:
-            style_options = [c.get(style, "") for c in candidates if c.get(style)]
-            # Prefer word-count-compliant candidates (same as main.py).
-            compliant = [o for o in style_options if in_word_range(style, o)]
-            pick_pool = compliant or style_options
-            if judge.available:
-                caption = judge.pick_best(style, scene, pick_pool)
-                judge_used_any = judge_used_any or len(pick_pool) > 1
-            else:
-                caption = next(iter(pick_pool), "")
-            result = caption
+            def polish_guarded(style, prompt_caption, baseline):
+                """Same guard as main.py: revert a polish that pushes an
+                in-range caption out of its style's word-count range."""
+                polished = judge.polish(style, scene, prompt_caption)
+                if (polished != baseline and in_word_range(style, baseline)
+                        and not in_word_range(style, polished)):
+                    return baseline
+                return polished
 
-            if config.ENABLE_JUDGE_POLISH and judge.available and style in HUMOR_STYLES_FOR_POLISH:
-                result = polish_with_word_guard(style, scene, result, result)
-                judge_used_any = True
+            for style in styles:
+                options = [c.get(style, "") for c in candidates if c.get(style)]
+                # Prefer candidates that already satisfy the word-count rule.
+                compliant = [o for o in options if in_word_range(style, o)]
+                pool = compliant or options
 
-            if config.ENABLE_SELF_CRITIQUE and judge.available:
-                for _ in range(config.MAX_CRITIQUE_RETRIES):
-                    score, feedback = judge.judge(style, scene, result)
-                    judge_used_any = True
-                    if score >= config.CRITIQUE_PASS_THRESHOLD:
-                        break
-                    hint = f"{result} (reviewer feedback to address: {feedback})" if feedback else result
-                    result = polish_with_word_guard(style, scene, hint, result)
+                if judge.available:
+                    caption = judge.pick_best(style, scene, pool)
+                else:
+                    caption = next(iter(pool), "")
+                result = caption
 
-            final_captions[style] = result or caption
+                if (config.ENABLE_JUDGE_POLISH and judge.available
+                        and style in HUMOR_STYLES_FOR_POLISH):
+                    result = polish_guarded(style, result, result)
 
-        elapsed = time.monotonic() - t0
-        return jsonify({
-            "captions": final_captions,
-            "scene_report": scene,
-            "judge_available": judge.available,
-            "judge_used": judge_used_any,
-            "elapsed_seconds": round(elapsed, 1),
-        })
+                critique_score = None
+                if config.ENABLE_SELF_CRITIQUE and judge.available:
+                    for _ in range(config.MAX_CRITIQUE_RETRIES):
+                        critique_score, feedback = judge.judge(style, scene, result)
+                        if critique_score >= config.CRITIQUE_PASS_THRESHOLD:
+                            break
+                        hint = (f"{result} (reviewer feedback to address: {feedback})"
+                                if feedback else result)
+                        result = polish_guarded(style, hint, result)
 
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+                final = result or caption
+                yield ndjson("caption", style=style, text=final,
+                             candidates=len(pool), score=critique_score,
+                             **caption_meta(style, final))
 
-    finally:
-        if local_path and os.path.exists(local_path):
-            try:
-                os.remove(local_path)
-            except OSError:
-                pass
+            yield ndjson("stage", id="judge", status="done")
+            yield ndjson("done", elapsed_seconds=round(time.monotonic() - t0, 1))
+
+        except SceneAnalysisFailed as e:
+            yield ndjson("error", message=f"The vision model could not analyze this clip: {e}")
+        except Exception as e:
+            traceback.print_exc()
+            yield ndjson("error", message=str(e))
+        finally:
+            # Match main.py: honour KEEP_DOWNLOADS so cached clips survive
+            # between runs (re-downloading a UHD clip every request is slow).
+            if local_path and os.path.exists(local_path) and not config.KEEP_DOWNLOADS:
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+
+    # No stream_with_context needed: everything the generator uses (video_url,
+    # styles) is read off the request above, so it never touches the request
+    # context once streaming starts.
+    return Response(stream(), mimetype="application/x-ndjson",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 if __name__ == "__main__":
+    if not config.FIREWORKS_API_KEY:
+        print("[!] FIREWORKS_API_KEY is not set — the UI will load but generation will fail.")
     print("[*] CaptionForge demo running at http://localhost:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)

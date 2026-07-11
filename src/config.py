@@ -23,7 +23,7 @@ KEEP_DOWNLOADS = os.environ.get("KEEP_DOWNLOADS", "false").lower() == "true"
 # --- Required for the primary (base caption) pass ---
 # Model roles were chosen by a head-to-head benchmark (2026-07-11, 3 sample
 # clips, cross-judged by glm-5p1 + deepseek-v4-pro on the official rubric):
-#   Stage 1 vision  -> kimi-k2p6      (most detailed, meme-aware scene reports;
+#   Stage 1 vision  -> kimi-k2p7-code      (most detailed, meme-aware scene reports;
 #                                      verified hallucination-free vs real frames)
 #   Stage 2 caption -> glm-5p2        (best caption writer: 0.874 vs 0.850 qwen,
 #                                      0.830 kimi-k2p7-code, 0.666 minimax-m3)
@@ -31,7 +31,7 @@ KEEP_DOWNLOADS = os.environ.get("KEEP_DOWNLOADS", "false").lower() == "true"
 #                                      the writer to avoid self-preference bias)
 # minimax-m3 was dropped: it failed to emit valid JSON on 2/3 clips even with
 # response_format=json_object.
-FIREWORKS_VISION_MODEL = os.environ.get("FIREWORKS_VISION_MODEL", "accounts/fireworks/models/kimi-k2p6")
+FIREWORKS_VISION_MODEL = os.environ.get("FIREWORKS_VISION_MODEL", "accounts/fireworks/models/kimi-k2p7-code")
 # Used when the primary vision model fails on a clip (degrade chain).
 FIREWORKS_VISION_FALLBACK_MODEL = os.environ.get("FIREWORKS_VISION_FALLBACK_MODEL", "accounts/fireworks/models/qwen3p7-plus")
 FIREWORKS_TEXT_MODEL = os.environ.get("FIREWORKS_TEXT_MODEL", "accounts/fireworks/models/glm-5p2")

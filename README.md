@@ -1,22 +1,63 @@
 # CaptionForge
 
-Track 2 (Video Captioning Agent) submission for AMD Developer Hackathon: Act II.
+Track 2 (Video Captioning Agent) submission for **AMD Developer Hackathon: Act II**.
 
 Watches a video clip and writes one caption per requested style —
 `formal`, `sarcastic`, `humorous_tech`, `humorous_non_tech` — using a
 three-model Fireworks pipeline where each model does the job it won in a
 head-to-head benchmark (2026-07-11, official sample clips, cross-judged on
-the official rubric by two neutral models):
+the official rubric by two neutral models).
+
+**Contents:** [Model pipeline](#model-pipeline) · [Accuracy & style safeguards](#accuracy--style-safeguards) ·
+[Official I/O contract](#official-io-contract-do-not-change) · [Pipeline stages](#pipeline-stages) ·
+[Credentials](#credentials-track-2-injects-none--must-be-baked-into-the-image) ·
+[Local dev](#local-dev) · [Web demo](#web-demo-optional) · [Docker](#docker--build-test-and-push) ·
+[Project layout](#project-layout)
+
+## Model pipeline
 
 | Role | Model | Why |
 |---|---|---|
-| Stage 1: scene analysis (vision) | `kimi-k2p6` | most detailed, meme-aware scene reports; verified hallucination-free against real frames |
+| Stage 1: scene analysis (vision) | `kimi-k2p7-code` | most detailed, meme-aware scene reports; verified hallucination-free against real frames |
 | Stage 2: caption writing | `glm-5p2` | best caption writer (0.874 vs 0.850 qwen3p7-plus, 0.830 kimi-k2p7-code, 0.666 minimax-m3) |
 | Best-of-N pick / judge / polish | `qwen3p7-plus` | runner-up quality, fastest, different family from the writer (no self-preference bias) |
 | Stage 1 fallback (degrade chain) | `qwen3p7-plus` | vision-capable second opinion if kimi fails on a clip |
 
 `minimax-m3` (previous default) was dropped after it failed to emit valid
 JSON on 2 of 3 benchmark clips even with `response_format=json_object`.
+
+## Accuracy & style safeguards
+
+The scene-report and caption prompts (`src/prompts.py`) are hardened against
+the two most common ways a vision-language model loses accuracy points on
+this task:
+
+- **No guessed specifics.** The model is explicitly forbidden from naming a
+  real-world city/country/landmark or a photographic technique ("long
+  exposure", "drone shot") unless it is confirmed on-screen — it must
+  describe generically instead ("a multi-lane urban street", "streaks of
+  light from moving traffic").
+- **No over-read on-screen text.** Signage/labels are only transcribed if
+  every letter is unmistakably legible; anything smaller, angled, or
+  partially visible is described generically rather than guessed.
+- **No upgraded poses.** An ambiguous pose is reported as the literal,
+  observable position ("looking down"), not promoted into a stronger claim
+  ("eyes closed", "falling asleep", "about to pounce") unless a frame shows
+  it beyond doubt.
+- **Sarcastic stays dry.** Tuned to the official spec ("dry, ironic, lightly
+  mocking") — deadpan understatement, not hype slang.
+
+On top of the prompts, `src/main.py` enforces two rules in code (zero extra
+API cost):
+
+- **Word-count guard** — Best-of-N candidates are pre-filtered to the
+  style's required word range before the judge picks; a self-critique polish
+  that would push an in-range caption *out* of range is automatically
+  reverted (`guarded_polish`).
+- **Style-conformant fallbacks** — if a clip fails, every style still gets a
+  generic caption that obeys its own word-count/emoji rules
+  (`FALLBACK_CAPTION_BY_STYLE`), instead of an "unavailable" message that
+  would score zero on both accuracy and style match.
 
 ## Official I/O contract (do not change)
 
@@ -39,30 +80,34 @@ must finish within **10 minutes** total (hidden eval set is ~12 clips,
 Track 2, which is why the pipeline spends extra calls on quality
 (Best-of-N + self-critique).
 
-## Pipeline
+## Pipeline stages
 
 1. **Download** with retry, `.tmp`-then-rename, and a hard wall-clock cap
    per download (`MAX_DOWNLOAD_WALL_SECONDS`, default 150s) so a slow
    trickling server can't eat the global budget.
-2. **Stage 1 — Scene Report** (`kimi-k2p6`): adaptive frame sampling — one
-   frame per ~8s, clamped to 8–16 frames, downscaled to 768px — into a
+2. **Stage 1 — Scene Report** (`kimi-k2p7-code`): adaptive frame sampling —
+   one frame per ~8s, clamped to 8–16 frames, downscaled to 768px — into a
    structured 10-section report (subject, environment, timeline, camera,
    lighting, audio, mood, standout details, humor potential, RISKS).
    Degrade chain on failure: fewer frames → `qwen3p7-plus`.
 3. **Stage 2 — Best-of-N captions** (`glm-5p2`): N=3 candidate caption sets
    generated in parallel at temperatures 0.6/0.85/1.0, text-only from the
    report.
-4. **Judge pass** (`qwen3p7-plus`): picks the best candidate per style, then
-   self-critique — any caption scoring below `CRITIQUE_PASS_THRESHOLD` (8/10)
-   is rewritten with the judge's feedback, up to `MAX_CRITIQUE_RETRIES` (2)
-   rounds. All judge/polish prompts carry the full per-style structural
-   rules (word counts, banned words, emoji rules).
+4. **Judge pass** (`qwen3p7-plus`): filters candidates to word-count-compliant
+   ones, picks the best per style, then self-critiques — any caption scoring
+   below `CRITIQUE_PASS_THRESHOLD` (8/10) is rewritten with the judge's
+   feedback, up to `MAX_CRITIQUE_RETRIES` (2) rounds, reverting if the rewrite
+   breaks the word-count rule. All judge/polish prompts carry the full
+   per-style structural rules (word counts, banned words, emoji rules).
 5. **Time budget**: clips are probed (HEAD) and scheduled heaviest-first,
    processed with `CONCURRENCY=6`; a hard wall-clock deadline
    (`TOTAL_BUDGET_SECONDS=540`) is enforced with
    `concurrent.futures.wait(..., timeout=...)` — any clip not done in time
-   gets a fallback caption instead of blocking the rest. `os._exit(0)` at
-   the end guarantees the process can't hang on a stuck thread.
+   gets a fallback caption instead of blocking the rest. Startup itself is
+   guarded too (malformed `tasks.json` or a missing API key still produces a
+   valid `results.json` and exit 0, never a crash with no output).
+   `os._exit(0)` at the end guarantees the process can't hang on a stuck
+   thread.
 
 No audio understanding on this path (Fireworks' Whisper endpoints were
 discontinued 2026-06-10); prompts explicitly force "No audio present" so the
@@ -82,7 +127,7 @@ the key embedded in its layers (extractable by anyone who pulls it): treat
 this hackathon key as disposable, watch the credit balance during the
 event, and rotate/revoke it after the event ends.
 
-## Setup (local dev)
+## Local dev
 
 ```bash
 cp .env.example .env   # fill in FIREWORKS_API_KEY
@@ -93,6 +138,23 @@ python src/main.py      # reads input/tasks.json, writes output/results.json
 Set `KEEP_DOWNLOADS=true` locally to cache clips in `scratch_videos/`
 between runs. Note: a full 12-clip UHD run on home bandwidth will hit the
 download caps by design — the judging VM has datacenter bandwidth.
+
+## Web demo (optional)
+
+`web_demo/` is a small Flask app for trying the pipeline interactively — not
+part of the submission (the real container is headless). It reuses the exact
+same pipeline code as `src/main.py`, so results match what the judged
+container would produce for the same clip.
+
+```bash
+pip install -r web_demo/requirements.txt
+python web_demo/app.py   # http://localhost:5000
+```
+
+Paste a clip URL (or click one of the three official example clips), pick
+styles, and watch live progress stream in — download → frame sampling/scene
+report/candidates → judge pick & self-critique — with each caption's
+word-count compliance shown as it arrives.
 
 ## Docker — build, test, and push
 
@@ -122,14 +184,18 @@ docker run --rm \
 ```
 
 Submissions are rate-limited to 10/hour — only submit after a clean local
-Docker run.
+Docker run. `.dockerignore` keeps the build context to just
+`requirements.txt` + `src/` (docs, the web demo, `.venv`, and `.env` never
+reach the image).
 
-## File map
+## Project layout
 
-- `src/main.py` — orchestration, concurrency, time budget, fallback handling
+- `src/main.py` — orchestration, concurrency, time budget, startup guards,
+  fallback handling, word-count guard
 - `src/fireworks_vision_client.py` — Stage 1 vision + Stage 2 Best-of-N generation
 - `src/judge_polish.py` — judge: pick-best, critique, polish (model set by `FIREWORKS_JUDGE_MODEL`)
-- `src/prompts.py` — all prompt text, style rules, judge rubrics
+- `src/prompts.py` — all prompt text, style rules, judge rubrics, accuracy safeguards
 - `src/downloader.py` — clip download with retry/timeout/wall-cap + size probing
 - `src/config.py` — all tunables, env-var driven, benchmark notes
-- `web_demo/` — local Flask demo (not part of the submission)
+- `web_demo/` — local Flask demo with live-progress streaming UI (not part of the submission)
+- `docs/` — Participant Guide, design notes, and pipeline-change history

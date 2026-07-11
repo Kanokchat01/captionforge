@@ -2,7 +2,7 @@
 CaptionForge — Track 2: Video Captioning Agent
 
 Reads /input/tasks.json, for each task downloads the clip, then runs the
-Fireworks frame-based pipeline: kimi-k2p6 scene report -> glm-5p2 writes
+Fireworks frame-based pipeline: kimi-k2p7-code scene report -> glm-5p2 writes
 Best-of-N candidate caption sets -> qwen3p7-plus judge picks the best per
 style, polishes humor styles, and self-critiques (all model roles chosen by
 benchmark, see config.py). Writes /output/results.json. Must exit 0, must

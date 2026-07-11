@@ -3,7 +3,7 @@ Primary captioner: Fireworks-hosted models over extracted still frames.
 
 Two-stage pipeline, frames-only (no audio — Fireworks' Whisper endpoints
 were confirmed discontinued as of 2026-06-10):
-  Stage 1: adaptive frame sampling -> vision model (kimi-k2p6, benchmark
+  Stage 1: adaptive frame sampling -> vision model (kimi-k2p7-code, benchmark
            winner for scene reports) -> structured 10-section Scene Report.
            Degrade chain on failure: fewer frames -> fallback vision model
            (qwen3p7-plus) so one flaky call never costs the whole clip.
