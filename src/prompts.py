@@ -1,38 +1,185 @@
 """
 Prompt construction for the Track 2 Video Captioning Agent.
 
-Two-stage frame-based pipeline (no audio — frames only):
-  Stage 1: sampled still frames + build_frame_scene_analysis_prompt ->
-           structured 10-section Scene Report
+Two-stage pipeline, two Stage-1 paths (no audio on either):
+  Stage 1 (primary):  whole clip via video_url + minimax-m3 ->
+                      build_native_video_scene_analysis_prompt ->
+                      structured 10-section Scene Report (sees real motion,
+                      timelines, camera movement)
+  Stage 1 (fallback): sampled still frames + build_frame_scene_analysis_prompt
+                      -> same 10-section Scene Report
   Stage 2: Scene Report (text only) + style rules -> 4 captions JSON
 
 Style keys MUST match the official spec exactly (underscore, not hyphen):
 formal, sarcastic, humorous_tech, humorous_non_tech
 """
+import hashlib
+import re
 
-# Short one-line descriptions, used by the pick-best/judge prompts as a
-# fallback when a style has no entry in STYLE_RULES.
+# The OFFICIAL style definitions, verbatim from the Participant Guide's
+# style table. The automated judge is almost certainly prompted with these
+# exact one-liners, so every internal prompt (writer, pick-best, critique)
+# leads with them rather than with our own invented constraints.
 STYLE_DESCRIPTIONS = {
-    "formal": "Professional, objective, factual tone. No jokes, no slang.",
-    "sarcastic": "Dry, ironic, lightly mocking tone — sarcasm must clearly "
-                 "land and stay recognizable as commentary on this specific clip.",
-    "humorous_tech": "Funny, with technology or programming references — "
-                      "ground the joke in something actually visible "
-                      "in the clip, not a generic tech pun.",
-    "humorous_non_tech": "Funny, everyday humor with no technical jargon — "
-                          "broadly relatable, grounded in the actual clip content.",
+    "formal": "Professional, objective, factual tone",
+    "sarcastic": "Dry, ironic, lightly mocking",
+    "humorous_tech": "Funny, with technology or programming references",
+    "humorous_non_tech": "Funny, everyday humour with no technical jargon",
 }
 
 # Numeric word-count ranges per style — MUST mirror the ranges written in
 # STYLE_RULES below. Used for programmatic compliance checks (candidate
-# filtering + polish revert guard) in main.py / web_demo.
+# filtering + polish revert guard) in main.py / web_demo. These are OUR
+# soft targets, not contest rules — the official rubric never counts words,
+# so the ranges are deliberately wide; they only exist to catch runaway
+# rewrites, not to straitjacket the writer.
 STYLE_WORD_RANGES = {
-    "formal": (25, 35),
-    "sarcastic": (15, 25),
-    "humorous_tech": (15, 25),
-    "humorous_non_tech": (15, 25),
+    "formal": (20, 40),
+    "sarcastic": (12, 30),
+    "humorous_tech": (12, 30),
+    "humorous_non_tech": (12, 30),
 }
-DEFAULT_WORD_RANGE = (15, 25)
+DEFAULT_WORD_RANGE = (12, 30)
+
+
+# Deterministic per-clip rotation for the humorous_non_tech opening.
+#
+# Why this exists: the style prompt used to merely SUGGEST four openings, and
+# the writer model collapsed onto the first one — 11 of 12 clips in the gcs12
+# dry run opened with "POV:", and "When you" / "Me trying to" were never used
+# once. Across a 12-clip judged batch that reads as one formula on repeat.
+# Suggestions don't fix it (the model just re-picks its favourite), and the
+# tasks run in parallel threads so they can't see each other's choices — so
+# the angle is ASSIGNED per clip from its position in the task list, giving a
+# perfectly even round-robin with no shared state and no randomness.
+NON_TECH_OPENINGS = [
+    ('POV:', 'drop the viewer inside the moment, second person'),
+    ('When you', 'frame it as a moment everyone recognises'),
+    ('Me trying to', 'self-deprecating, first person'),
+    ('That feeling when', 'name the shared emotion behind the moment'),
+]
+
+
+def non_tech_opening_rule(variety_index: int) -> str:
+    """The assigned opening for this clip's humorous_non_tech caption, phrased
+    so the model can't mistake the instruction for text to copy — an earlier
+    wording ("Open with ...") got echoed literally into two captions as
+    "Opening with: ..." / "Opening phrase: ...")."""
+    phrase, why = NON_TECH_OPENINGS[variety_index % len(NON_TECH_OPENINGS)]
+    return (f'the caption text itself must begin with the exact words "{phrase}" '
+            f'({why})')
+
+
+# Per-clip emoji palettes, rotated the same way and for the same reason.
+#
+# Giving every clip one long menu of "good" emoji just moves the collapse:
+# handed a list, the writer takes whatever sits first (👏 landed on 8 of 12
+# clips, 🔄 on 9 of 12). Rotating a SMALL palette per clip keeps the choice
+# genuine — the model still picks whichever of two or three actually fits the
+# joke — while guaranteeing the batch doesn't converge on one emoji.
+#
+# The palettes are organised by what the emoji has to DO for that style:
+#   sarcastic         -> mark the irony (mock-celebrate the mundane), or none
+#   humorous_tech     -> reinforce the tech frame that defines the style
+#   humorous_non_tech -> carry the human feeling; never a device
+EMOJI_PALETTES = {
+    "sarcastic": [
+        "no emoji at all — end the line bare, the deadpan is the joke",
+        "👏 or 🎉 (mock-applause for something utterly mundane)",
+        "🏆 or 🥇 (mock-award for a non-achievement)",
+        "🥱 or ⭐ (mock-boredom / sarcastic gold star)",
+    ],
+    "humorous_tech": [
+        "💻 or 🖥️ (the machine itself)",
+        "🐛 or ⚠️ (bug / error framing)",
+        "🔌 or 🔋 (power / hardware framing)",
+        "🔄 or ⚙️ (loop / process framing)",
+    ],
+    "humorous_non_tech": [
+        "😅 (nervous, caught-out laughter)",
+        "🥲 (fond suffering)",
+        "🙃 (resigned absurdity)",
+        "😭 or ☕ (dramatic despair, or a mundane everyday prop)",
+    ],
+}
+
+
+def emoji_palette_rule(style: str, variety_index: int) -> str:
+    """This clip's assigned emoji palette for one style, or "" if the style
+    has none (formal never carries an emoji)."""
+    palette = EMOJI_PALETTES.get(style)
+    if not palette:
+        return ""
+    return palette[variety_index % len(palette)]
+
+
+def stable_variety_index(key: str) -> int:
+    """Fallback when there's no task position to rotate on (e.g. the web
+    demo runs one clip at a time). Python's built-in hash() is salted per
+    process, so use a stable digest instead — the same clip always gets the
+    same angle, which keeps demo output reproducible."""
+    return int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16) % len(NON_TECH_OPENINGS)
+
+
+# humorous_non_tech is DEFINED by the absence of tech ("Funny, everyday humour
+# with no technical jargon"), so a single tech word in it directly costs the
+# style-match half of that caption's score. The writer mostly obeys, but a
+# 12-clip run still produced "a high-stakes game of human Tetris" — a video
+# game reference inside the no-tech style. Best-of-N makes this cheap to fix
+# in code: candidates carrying any of these words are dropped before the judge
+# ever sees them (main.py), with a fallback to the full pool if every
+# candidate trips the filter. Only unambiguous computing/gaming terms are
+# listed — words like "screen", "system", or "bug" have innocent everyday
+# senses and would cause false rejections.
+TECH_JARGON_RE = re.compile(
+    r"\b("
+    r"wi-?fi|internet|online|offline|download(?:ing|ed)?|upload(?:ing|ed)?|"
+    r"software|hardware|computer|laptop|keyboard|desktop|smartphone|"
+    r"algorithm|coding|programming|program|debug(?:ging)?|compile[rd]?|"
+    r"server|database|api|cache|latency|bandwidth|firmware|router|"
+    r"buffering|glitch|render(?:ing|ed)?|pixel|byte|cpu|gpu|ram|usb|"
+    r"respawn|spawn(?:s|ed|ing)?|npc|hitbox|speed-?run|pathfinding|"
+    r"tetris|minecraft|app|gadget|robot(?:ic)?s?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def has_tech_jargon(text: str) -> bool:
+    """True if a caption contains a term that would break humorous_non_tech's
+    'no technical jargon' definition."""
+    return bool(TECH_JARGON_RE.search(text))
+
+
+# Meta-labels the writer has been caught pasting into the caption itself when
+# it mistook a prompt instruction for text to copy (real examples from a
+# 12-clip run: "Opening with: Watching the tiny cars scurry below...",
+# "Opening phrase: Let's be real,\nLet's be real, my fingers are moving...").
+# The prompt wording that caused it is fixed, but a caption is the one artifact
+# the judge reads — cheap to scrub as a last line of defence.
+_LEAKED_LABEL_RE = re.compile(
+    r"^\s*(opening(?:\s+(?:with|phrase|line))?|caption|answer|output|style)\s*[:\-–]\s*",
+    re.IGNORECASE,
+)
+
+
+def sanitize_caption(text: str) -> str:
+    """Strip prompt-instruction leakage, collapse newlines, drop stray wrapping
+    quotes, and de-duplicate an opener the model repeated after a leaked label.
+    Returns a single clean line."""
+    cleaned = " ".join(str(text).split())  # collapses newlines and runs of spaces
+    for _ in range(2):  # a label can survive one strip, e.g. "Caption: Opening: ..."
+        stripped = _LEAKED_LABEL_RE.sub("", cleaned)
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in "\"'":
+        cleaned = cleaned[1:-1].strip()
+    # "Let's be real, Let's be real, my fingers..." -> keep one copy of the head
+    head = re.match(r"^(.{4,40}?[,:])\s*\1\s*", cleaned)
+    if head:
+        cleaned = f"{head.group(1)} {cleaned[head.end():]}"
+    return cleaned.strip()
 
 
 def word_count(text: str) -> int:
@@ -45,54 +192,69 @@ def in_word_range(style: str, text: str) -> bool:
     return lo <= word_count(text) <= hi
 
 
-# Full per-style generation rules used in Stage 2 (verbatim from the team's
-# prompt design, word counts + structural rules + banned openings).
+# Full per-style generation rules used in Stage 2. Each entry LEADS with the
+# official Participant Guide definition verbatim (what the real judge scores
+# against); everything after it is craft guidance, kept deliberately looser
+# than before — the automated judge scores accuracy + style match only, it
+# never counts words or checks openings, so rigid structural rules only cost
+# creativity without buying points.
 STYLE_RULES = {
     "formal": (
-        'FORMAL (25-35 words): Professional, factual, objective. Use clear '
-        'simple English a news anchor would say. No slang. No emojis. Do '
-        'not start with "The scene shows" or "The video captures." Do not '
-        'end with a generic summary sentence. Describe the setting generically '
-        '(e.g. "an urban street," "a modern office") — never name a specific '
-        'real-world city, country, or landmark unless it is explicitly written '
-        'in the report as confirmed by legible on-screen text. Describe only '
-        'visible effects (e.g. "streaks of light from moving traffic") — never '
-        'name the photographic technique or equipment behind them (e.g. do not '
-        'say "long exposure," "drone shot," "time-lapse").'
+        'FORMAL — official definition: "Professional, objective, factual '
+        'tone." Aim for roughly 20-40 words. Clear, simple English a news '
+        'anchor would read. No slang, no emojis, no jokes. Do not start '
+        'with "The scene shows" or "The video captures," and do not end '
+        'with a generic summary sentence. Describe the setting generically '
+        '(e.g. "an urban street," "a modern office") — never name a '
+        'specific real-world city, country, or landmark. You may name a '
+        'playback effect (time-lapse, slow motion) ONLY if the analysis '
+        'report itself states it; never name capture equipment or settings '
+        '(drone, lens type, exposure).'
     ),
     "sarcastic": (
-        'SARCASTIC (15-25 words): Dry, deadpan, ironic — understate rather '
-        'than hype. Short, flat sentences only, subject-verb-object order '
-        '(e.g. "The kitten pounces" not "Pouncing is what the kitten does"). '
-        'Never start with "Truly", "Such", "Witnessing", or "Behold". '
-        'Actually mock something specific and concrete in the video — the '
-        'irony comes from the flat, matter-of-fact delivery of an absurd or '
-        'mundane observation, not from hype or exclamation. Avoid loud '
-        'Gen-Z hype slang (e.g. do not force in "main character energy," '
-        '"aura points," "cooked," "no cap," "rent free") — a light touch of '
-        'contemporary phrasing is fine only if it stays understated, never '
-        'as the whole joke. End with a dry, lightly mocking punchline; add '
-        '1 emoji only if it stays restrained rather than making the line '
-        'feel hyped.'
+        'SARCASTIC — official definition: "Dry, ironic, lightly mocking." '
+        'Aim for roughly 12-30 words. Deadpan understatement beats hype: '
+        'short, flat sentences in subject-verb-object order. Mock something '
+        'specific and concrete in THIS clip — the irony comes from the '
+        'flat, matter-of-fact delivery of an absurd or mundane observation, '
+        'never from hype or exclamation. Avoid loud Gen-Z hype slang '
+        '("main character energy," "aura points," "cooked," "no cap") — '
+        'a light touch of contemporary phrasing is fine if it stays '
+        'understated. A dry, lightly mocking punchline ending lands well. '
+        'EMOJI: this clip has an assigned emoji palette (given below) — use '
+        'only that. Its job is to MARK THE IRONY, never to label the subject: '
+        'a plain subject emoji (🐕 🌊 🚗) kills the deadpan, and the worn-out '
+        'reaction faces 😐 🙄 are banned outright.'
     ),
     "humorous_tech": (
-        'HUMOROUS_TECH (15-25 words): Pick ONE tech concept and connect it '
-        'to what is actually happening in the video. The joke MUST explicitly '
-        'name the specific subject, object, or action from the KEY ACTIONS or '
-        'STANDOUT DETAILS sections (e.g. the actual animal, vehicle, or person '
-        'and what it is doing) — a tech pun that never mentions anything '
-        'specific to this clip and could be pasted onto any video is a FAIL. '
-        'Do not list multiple tech concepts. Punchy, one core joke. 1 emoji.'
+        'HUMOROUS_TECH — official definition: "Funny, with technology or '
+        'programming references." Aim for roughly 12-30 words. Build ONE '
+        'clear tech or programming joke on something actually happening in '
+        'the video — explicitly name the specific subject, object, or '
+        'action from the report (the actual animal, vehicle, or person and '
+        'what it is doing). A generic tech pun that could be pasted onto '
+        'any video is a FAIL. One core joke, punchy delivery. EMOJI: exactly '
+        '1, from this clip\'s assigned palette (given below); its job is to '
+        'REINFORCE THE TECH FRAME that defines this style. An animal or '
+        'scenery emoji here quietly undercuts the tech reference the judge '
+        'is looking for.'
     ),
     "humorous_non_tech": (
-        'HUMOROUS_NON_TECH (15-25 words): Rotated openings. Start strictly with '
-        'one of these four phrases based on the scene context: "POV:", "When you", '
-        '"Me trying to", or "That feeling when". Connect to highly relatable, everyday '
-        'human struggles, social anxiety, work exhaustion, or awkward moments. Vary your '
-        'scenarios dynamically depending on the video domain (e.g., exhaustion for sports, '
-        'extreme hunger for food, social dread for interviews/news, rhythm tracking for music, '
-        'or weather ruined plans). Never use a repetitive or generic formula. Keep it punchy. '
-        'End with exactly 1 relevant emoji.'
+        'HUMOROUS_NON_TECH — official definition: "Funny, everyday humour '
+        'with no technical jargon." Aim for roughly 12-30 words. Relatable '
+        'everyday humor grounded in what the clip actually shows — match the '
+        'scenario to the video\'s domain (exhaustion for sports, hunger for '
+        'food, social dread for interviews, weather-ruined plans...). The '
+        'joke must be a real human moment, not a restatement of the scene. '
+        'Zero technical content of any kind — no computing, internet, gaming, '
+        'or engineering references, and no video-game names (a line like "a '
+        'game of human Tetris" already breaks this style). EMOJI: exactly 1, '
+        'from this clip\'s assigned '
+        'palette (given below); its job is to carry the HUMAN FEELING. A '
+        'device or computing emoji (⌨️ 💻 🖥️ 📶 🔌) is banned outright — '
+        'this style is defined as having NO technical content, and a tech '
+        'emoji hands the judge a reason to mark it down. Use exactly the '
+        'assigned opening phrase given below.'
     ),
 }
 
@@ -172,6 +334,76 @@ Important:
 """
 
 
+def build_native_video_scene_analysis_prompt() -> str:
+    """Stage 1 prompt for the native-video path: the model receives the WHOLE
+    clip via video_url (minimax-m3), so unlike the frame path it can describe
+    continuous motion, real timelines, and camera movement. Same 10-section
+    Scene Report structure as the frame path, so Stage 2 needs no changes.
+
+    Two hard lessons baked in:
+    - No audio reaches the model over video_url (verified 2026-07-11), so
+      section 6 stays forced to "No audio present."
+    - Native-video OCR is confidently WRONG (read a real "KOREA ILLIES
+      ENGINEERING" building sign as "KOREA MEDIA ENGINEERING"), so on-screen
+      text transcription is banned absolutely — no legibility exception like
+      the frame prompt had."""
+    return """You are a professional video analyst. You are given a full video clip (typically 30 seconds to 2 minutes long). You do NOT have the audio track — analyze the visuals only; do not guess at or invent any sound, dialogue, or music.
+
+If the video cannot be analyzed (corrupted, blank, no visual content), write only: "ANALYSIS FAILED: [brief reason]" and stop. Do not guess or invent content you cannot actually see.
+
+Pay close attention to: visual details, actions as they unfold over time, camera movement, lighting, and mood. You watched the whole clip, so describe real motion and real transitions — but never upgrade an ambiguous pose or moment into a definite inner state.
+
+Keep each section concise — 2-4 sentences, except Key Actions and Standout Details which may use short bullet points. Avoid padding with generic description.
+
+Write your report in the following 10 sections:
+
+--- SCENE REPORT ---
+
+1. SUBJECT
+Who or what is the main focus? Describe appearance in detail (species, color, size, clothing, expression, distinguishing features).
+Report gaze and eyes only as directly visible. While a subject is actively doing a task (typing, reading, eating), lowered or hidden eyes almost always mean the gaze is aimed at that task — only state the eyes are closed if the video shows it unmistakably.
+
+2. ENVIRONMENT
+Where does this take place? Describe the setting, surfaces, objects, background elements, weather, and time of day. Describe the TYPE of place generically (e.g. "a multi-lane urban street," "an office with desks and computer monitors"). Do NOT name a specific real-world city, country, neighborhood, or landmark — guessing a location from visual style (architecture, plants, signage style, language on signs) is exactly the kind of unconfirmed claim that must NOT appear here.
+
+3. KEY ACTIONS (timeline)
+Describe chronologically what actually happens across the clip, from beginning to middle to end, with approximate timestamps.
+Format: [MM:SS] Action/description around that moment.
+Example: [00:03] A kitten steps out from behind leafy branches and walks toward the camera.
+You watched the motion happen, so continuous actions and transitions ARE fair to describe (e.g. "traffic gradually backs up," "she turns from one monitor to the other") — but describe observable behavior only, never assumed intent or inner states.
+
+4. CAMERA & FRAMING
+Describe the camera angle (low, high, eye-level), framing (close-up, wide shot, depth of field), and camera MOVEMENT as actually seen: static, panning, tilting, dollying/pushing in or out, tracking a subject, zooming. Getting camera movement right matters — apparent motion of foreground objects is often the camera moving, not the objects. You may name a playback-speed effect (time-lapse, slow motion) ONLY when the motion itself shows it unmistakably. Never guess at capture equipment (drone, crane, gimbal, lens type, exposure settings) — that is production speculation, not observation.
+
+5. LIGHTING & COLOR
+Describe the dominant light source, color palette, contrast, and any notable visual effects (lens flare, bokeh, golden hour glow, neon).
+
+6. AUDIO
+No audio track was provided for analysis. Write exactly: "No audio present." Do not guess at implied or expected sounds.
+
+7. MOOD & ATMOSPHERE
+What emotion does the clip evoke? (e.g., peaceful, chaotic, tense, heartwarming, eerie, comedic)
+
+8. STANDOUT DETAILS
+List 3-5 specific, quirky, or memorable details that make this video unique — including things that only motion reveals (a repeated gesture, a rhythm in the traffic, a sudden stop). These are the best ingredients for humor and captions.
+
+9. HUMOR POTENTIAL
+What is naturally funny, ironic, cute, dramatic, or absurd about this video? Think like a meme creator. Identify the 'comedy goldmine' moments, especially ones the motion itself creates. Base this only on what is visually confirmed in sections 1-5 — if a subject "looks annoyed," describe the visible expression, don't assert the subject IS annoyed.
+
+10. RISKS (things NOT confirmed)
+List anything a caption writer might assume or hallucinate that is NOT actually shown: real-world location/city/landmark names (never confirmable), capture equipment (never confirmable), the wording of ANY on-screen text (never transcribable — see rule below; note here that signs/text are present but must stay generic), and that no audio was available.
+Example: "No other animals appear. Location not identifiable. Capture equipment not identifiable. A building sign and storefront text are visible but their wording must NOT be quoted. No audio track analyzed."
+
+--- END REPORT ---
+
+Important:
+- Be specific, not generic. "Orange tabby kitten" not just "a cat."
+- Describe what you actually SEE. Do not upgrade an ambiguous moment into a definite claim: a lowered head is "looking down," NOT "falling asleep"; a crouched animal is "crouched low," NOT necessarily "about to pounce."
+- If unsure about something, say "possibly" or "appears to be." Anything marked this way is unconfirmed, not fact.
+- ON-SCREEN TEXT (signs, labels, screens, clothing print): video compression and downscaling make text unreliable — you WILL misread it even when it looks perfectly clear to you. NEVER transcribe, quote, paraphrase, or partially reconstruct ANY on-screen text anywhere in this report. No exceptions, not even for large, sharp, prominent titles. Describe such text generically instead ("a building sign," "a storefront banner," "text on the monitor"), optionally with position/size/color, and record its presence in RISKS.
+"""
+
+
 CAPTION_GENERATION_SHARED_RULES = """If the video analysis lacks sufficient detail for a style's word count, write a shorter, purely factual caption instead of inventing content to fill the length.
 
 Rules:
@@ -183,46 +415,58 @@ Rules:
 - No questions, no hashtags, no call-to-action, no markdown.
 - Before finalizing, count the words in each caption and confirm it fits the required range for that style.
 
-Grounding: Every claim must come from the video analysis report above. Check the RISKS section of the report — do not include anything flagged there as uncertain or unconfirmed. Never put specific sign/label/screen text in quotes unless the report explicitly states it was clearly and confidently legible — if the report only mentions signage generically (e.g. "a building sign"), your caption must also stay generic and must not invent specific wording for it.
+Grounding: Every claim must come from the video analysis report above. Check the RISKS section of the report — do not include anything flagged there as uncertain or unconfirmed. Never name a real-world city, country, or landmark.
+
+ON-SCREEN TEXT — ABSOLUTE RULE: never quote, transcribe, or paraphrase the wording of any sign, label, screen, or clothing text in a caption, even if the report mentions text exists. Automated OCR of compressed video misreads text confidently, and a caption quoting misread text is scored as a factual error, while a generic description ("a building sign," "text on the screen") is never penalized. Always describe text generically.
 
 BANNED WORDS (never use — they sound like AI):
-thoroughfare, bustling, captivating, witnessing, observing, commences, showcases, delves, furthermore, utilizing, vibrant, pivotal, intricate, landscape, tapestry, multifaceted, underscores, endeavor, realm
+bustling, captivating, showcases, delves, vibrant, tapestry, multifaceted, realm
+
+EMOJI — the emoji serves the STYLE, not the subject. The clip's content is already in your words; an emoji that just names the subject (🐕 for a dog clip, 🌊 for a beach clip) is decoration that does nothing for the tone being judged. Each style's emoji has a different job: formal carries none ever; sarcastic marks the irony; humorous_tech reinforces the tech frame that defines it; humorous_non_tech carries the human feeling and never a device. Each style is given an assigned palette for this clip below — stay inside it, never copy the emoji from the example captions below, and never end two captions of this clip on the same emoji.
 
 WRONG vs RIGHT FOR SARCASTIC (Dry and Deadpan, Not Hype Slang):
 ❌ "The kitten struts in dripping with main character energy, aura points maxed, we are so cooked 😭" — loud hype slang, not dry
-✅ "The kitten struts past like it owns the place. It does not. 😐" — flat, deadpan, ironic
+✅ "The kitten struts past like it owns the place. It does not." — flat, deadpan, ironic; no emoji needed
 ❌ "Traffic is absolutely giving main character syndrome right now, no cap 💀" — hype-speak, not mockery
-✅ "Traffic barely moves. Everyone still drives like they're late for something important. 🙄" — dry observation, lightly mocking
+✅ "Traffic barely moves. Everyone still drives like they're late for something important. 👏" — dry observation, mock-applause marks the irony
 
-WRONG vs RIGHT FOR FORMAL (Never Guess Location or Camera Technique):
-❌ "A congested road in Seoul's Guro district" — naming an unconfirmed real city/district
-✅ "A congested multi-lane urban street" — describe the setting generically instead
-❌ "Long exposure photography turns traffic into streaks of light" — naming an unconfirmed capture technique
-✅ "Passing traffic appears as streaks of light in the frame" — describe only the visible effect
-
-WRONG vs RIGHT FOR HUMOROUS_NON_TECH (Dynamic Scenarios Based on Domain):
-❌ "POV: When you get stuck in the bustling urban grid during rush hour"
-✅ "When you get stuck in afternoon traffic and realize everyone else is also pretending to have somewhere important to be 🚗"
-❌ "POV: When the feline navigates the green garden foliage"
+WRONG vs RIGHT FOR HUMOROUS_NON_TECH (Specific and Relatable, Not a Scene Summary):
+❌ "POV: When the feline navigates the green garden foliage" — just re-describes the scene, no joke
 ✅ "POV: You open a bag of snacks as quietly as possible, but the local furry overlord still hears it from a mile away 🍗"
-❌ "Me trying to see the beautiful landscape and mountains in the quiet nature"
+❌ "Me trying to see the beautiful landscape and mountains in the quiet nature" — generic, no relatable angle
 ✅ "That feeling when you escape to nature for some peace, but the absolute silence starts making you feel highly suspicious 🌲"
-❌ "POV: Looking at the person playing musical instruments or reporting news"
-✅ "Me trying to nod along to the complex jazz solo like I actually understand music theory 🎸"
-❌ "When you watch the news reporter talk on television"
-✅ "POV: The professor randomly calls your name to explain the reading material you did not even open 🎤"
-❌ "Me trying to exercise or run on the sports field"
-✅ "Me trying to finish the last set of squats when my legs are already acting like jelly 🏋️"
-❌ "That feeling when you see delicious food on the table"
-✅ "That feeling when the waiter passes your table with food, but it is actually for the person behind you 🍕"
 """
 
 
-def build_caption_generation_prompt(scene_report: str, styles: list) -> str:
+def build_caption_generation_prompt(scene_report: str, styles: list, variety_index: int = 0) -> str:
     """Stage 2 prompt: text-only, works purely from the Stage 1 Scene Report
-    (no video re-attached — cheaper and faster than a second video call)."""
-    style_blocks = "\n\n".join(STYLE_RULES.get(s, f"{s.upper()} (15-25 words): write in this requested style.") for s in styles)
+    (no video re-attached — cheaper and faster than a second video call).
+
+    `variety_index` is the clip's position in the task list; it selects this
+    clip's assigned humorous_non_tech opening so a whole judged batch doesn't
+    come back as twelve "POV:" captions (see NON_TECH_OPENINGS)."""
+    style_blocks = "\n\n".join(STYLE_RULES.get(s, f"{s.upper()} (12-30 words): write in this requested style.") for s in styles)
     keys_example = ", ".join(f'"{s}": "..."' for s in styles)
+
+    # Per-clip assignments (opening + emoji palettes). These are rotated by
+    # position in the task list precisely because open-ended menus collapse:
+    # left to its own devices the writer opened 11 of 12 clips with "POV:" and
+    # ended 8 of 12 sarcastic captions on 👏.
+    lines = []
+    if "humorous_non_tech" in styles:
+        lines.append(f"- humorous_non_tech opening: {non_tech_opening_rule(variety_index)}")
+    for s in styles:
+        palette = emoji_palette_rule(s, variety_index)
+        if palette:
+            lines.append(f"- {s} emoji: {palette}")
+    assignment = ""
+    if lines:
+        assignment = (
+            "\nPER-CLIP ASSIGNMENTS (these rotate from clip to clip so the batch "
+            "never repeats one formula — follow them exactly):\n"
+            + "\n".join(lines)
+            + "\n"
+        )
     return f"""Using ONLY the following video analysis report, generate {len(styles)} caption(s).
 
 --- VIDEO ANALYSIS REPORT ---
@@ -234,7 +478,7 @@ def build_caption_generation_prompt(scene_report: str, styles: list) -> str:
 Styles required for this clip:
 
 {style_blocks}
-
+{assignment}
 Output JSON only with exactly these keys: {{{keys_example}}}
 """
 
@@ -264,23 +508,25 @@ def build_judge_polish_prompt(style: str, scene_hint: str, draft_caption: str) -
 
 
 PICK_BEST_SYSTEM_PROMPT = (
-    "You are a strict judge for a video-captioning contest. You are given "
-    "the video's scene details and several numbered candidate captions for "
-    "ONE requested style. Pick the single best candidate on two equally "
-    "weighted dimensions: (a) accuracy — it must faithfully reflect the "
-    "described scene with no invented facts, and (b) style match — it must "
-    "genuinely land in the requested tone rather than being generic or "
-    "AI-sounding. A candidate that violates the stated style rules (word "
-    "count, required opening, emoji count) must not be picked over one that "
-    "follows them. Respond with ONLY a JSON object: "
-    '{"best": <1-based candidate number>}.'
+    "You are the judge for a video-captioning contest. You are given the "
+    "video's scene details and several numbered candidate captions for ONE "
+    "requested style. The contest scores exactly two things, equally "
+    "weighted: (a) accuracy — the caption faithfully reflects the described "
+    "scene with no invented facts (inventing on-screen text wording or a "
+    "real-world location is an automatic disqualifier), and (b) style "
+    "match — it genuinely lands in the officially defined style rather "
+    "than being generic or AI-sounding. For the sarcastic and humorous "
+    "styles, a genuinely sharp, funny, specific caption beats a safe "
+    "generic one — but never at the cost of accuracy. Word counts and "
+    "suggested openings are soft guidance, not disqualifiers. Respond with "
+    'ONLY a JSON object: {"best": <1-based candidate number>}.'
 )
 
 
 def build_pick_best_prompt(style: str, scene_hint: str, candidates: list) -> str:
-    # Give the picker the SAME full style rules the scoring judge enforces
-    # (word count, required openings, emoji) so it can't select an out-of-spec
-    # candidate the judge would later penalize.
+    # Give the picker the full style rules (which lead with the official
+    # definition); the system prompt tells it to treat structural details
+    # as soft guidance, so tone + accuracy decide the pick.
     rules = STYLE_RULES.get(style, STYLE_DESCRIPTIONS.get(style, ""))
     numbered = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(candidates))
     return (
@@ -291,12 +537,16 @@ def build_pick_best_prompt(style: str, scene_hint: str, candidates: list) -> str
 
 
 JUDGE_SYSTEM_PROMPT = (
-    "You are a strict judge scoring a video caption on a 0-10 scale for two "
-    "things combined into one score: (a) accuracy — does it faithfully "
-    "reflect the described scene, and (b) style match — does it genuinely "
-    "match the requested tone rather than being generic. Respond with ONLY "
-    "a JSON object: {\"score\": <0-10 number>, \"feedback\": \"<one short "
-    "actionable sentence for how to improve it if score < 8>\"}."
+    "You are a strict judge scoring a video caption on a 0-10 scale for the "
+    "contest's two official axes combined into one score, equally weighted: "
+    "(a) accuracy — does it faithfully reflect the described scene with no "
+    "invented facts (quoted on-screen text or a named real-world location "
+    "is an automatic fail), and (b) style match — does it genuinely land in "
+    "the officially defined style; for sarcastic/humorous styles that means "
+    "it is actually funny or biting about THIS clip, not generic filler. "
+    "Do not deduct points for word count or opening phrasing. Respond with "
+    "ONLY a JSON object: {\"score\": <0-10 number>, \"feedback\": \"<one "
+    "short actionable sentence for how to improve it if score < 8>\"}."
 )
 
 

@@ -40,7 +40,14 @@ import config
 from downloader import download_video
 from fireworks_vision_client import FireworksCaptioner, SceneAnalysisFailed
 from judge_polish import JudgeAssistant
-from prompts import STYLE_WORD_RANGES, in_word_range, word_count
+from prompts import (
+    STYLE_WORD_RANGES,
+    has_tech_jargon,
+    in_word_range,
+    sanitize_caption,
+    stable_variety_index,
+    word_count,
+)
 
 app = Flask(__name__)
 
@@ -132,15 +139,34 @@ def generate():
         try:
             captioner, judge = get_clients()
 
-            # --- Stage 1: download -------------------------------------
+            # --- Stage 1: download (lazy, same as main.py) ---------------
+            # The native-video path sends the URL straight to Fireworks, so
+            # the UHD file is only downloaded if the frame fallback runs.
             yield ndjson("stage", id="download", status="active")
-            local_path = download_video(video_url)
-            size_mb = os.path.getsize(local_path) / (1024 * 1024)
-            yield ndjson("stage", id="download", status="done", detail=f"{size_mb:.1f} MB")
 
-            # --- Stage 2: frames -> scene report -> Best-of-N -----------
+            def ensure_downloaded() -> str:
+                nonlocal local_path
+                if local_path is None:
+                    local_path = download_video(video_url)
+                return local_path
+
+            if not (config.ENABLE_NATIVE_VIDEO and video_url):
+                ensure_downloaded()
+            if local_path:
+                size_mb = os.path.getsize(local_path) / (1024 * 1024)
+                yield ndjson("stage", id="download", status="done", detail=f"{size_mb:.1f} MB")
+            else:
+                yield ndjson("stage", id="download", status="done",
+                             detail="skipped — URL sent straight to the native video model")
+
+            # --- Stage 2: scene report (native video, frame fallback) -> Best-of-N
             yield ndjson("stage", id="analyze", status="active")
-            candidates, scene = captioner.caption_clip(local_path, styles)
+            # One clip at a time here, so there's no batch position to rotate
+            # on — derive a stable angle from the URL instead (same clip always
+            # gets the same humorous_non_tech opening).
+            candidates, scene = captioner.caption_clip(
+                ensure_downloaded, styles, video_url=video_url,
+                variety_index=stable_variety_index(video_url))
             yield ndjson("stage", id="analyze", status="done",
                          detail=f"{len(candidates)} candidate set(s)")
             yield ndjson("scene", report=scene)
@@ -151,7 +177,7 @@ def generate():
             def polish_guarded(style, prompt_caption, baseline):
                 """Same guard as main.py: revert a polish that pushes an
                 in-range caption out of its style's word-count range."""
-                polished = judge.polish(style, scene, prompt_caption)
+                polished = sanitize_caption(judge.polish(style, scene, prompt_caption))
                 if (polished != baseline and in_word_range(style, baseline)
                         and not in_word_range(style, polished)):
                     return baseline
@@ -159,6 +185,10 @@ def generate():
 
             for style in styles:
                 options = [c.get(style, "") for c in candidates if c.get(style)]
+                # Same tech-jargon guard as main.py: humorous_non_tech is
+                # defined as having none, so drop candidates that carry it.
+                if style == "humorous_non_tech":
+                    options = [o for o in options if not has_tech_jargon(o)] or options
                 # Prefer candidates that already satisfy the word-count rule.
                 compliant = [o for o in options if in_word_range(style, o)]
                 pool = compliant or options

@@ -18,13 +18,17 @@ the official rubric by two neutral models).
 
 | Role | Model | Why |
 |---|---|---|
-| Stage 1: scene analysis (vision) | `kimi-k2p7-code` | most detailed, meme-aware scene reports; verified hallucination-free against real frames |
+| Stage 1: scene analysis (native video) | `minimax-m3` | the only account model that accepts the WHOLE clip via `video_url` (verified by real calls; kimi/qwen reject video input) — sees motion, real timelines, and camera movement that still frames can't, in ~4–12s per clip with no local download at all |
+| Stage 1 fallback #1 (frames) | `kimi-k2p7-code` | most detailed, meme-aware frame-based scene reports; verified hallucination-free against real frames |
+| Stage 1 fallback #2 (frames) | `qwen3p7-plus` | vision-capable second opinion if kimi also fails on a clip |
 | Stage 2: caption writing | `glm-5p2` | best caption writer (0.874 vs 0.850 qwen3p7-plus, 0.830 kimi-k2p7-code, 0.666 minimax-m3) |
 | Best-of-N pick / judge / polish | `qwen3p7-plus` | runner-up quality, fastest, different family from the writer (no self-preference bias) |
-| Stage 1 fallback (degrade chain) | `qwen3p7-plus` | vision-capable second opinion if kimi fails on a clip |
 
-`minimax-m3` (previous default) was dropped after it failed to emit valid
-JSON on 2 of 3 benchmark clips even with `response_format=json_object`.
+`minimax-m3` is deliberately **only** the eyes, never the writer: it scored
+0.666 on caption writing and failed JSON output on 2 of 3 benchmark clips —
+but Stage 1 returns plain text, so neither weakness applies there. Its OCR
+is also untrusted (it confidently misread a real building sign in testing),
+which is why the prompts ban transcribing on-screen text outright.
 
 ## Accuracy & style safeguards
 
@@ -33,13 +37,17 @@ the two most common ways a vision-language model loses accuracy points on
 this task:
 
 - **No guessed specifics.** The model is explicitly forbidden from naming a
-  real-world city/country/landmark or a photographic technique ("long
-  exposure", "drone shot") unless it is confirmed on-screen — it must
-  describe generically instead ("a multi-lane urban street", "streaks of
-  light from moving traffic").
-- **No over-read on-screen text.** Signage/labels are only transcribed if
-  every letter is unmistakably legible; anything smaller, angled, or
-  partially visible is described generically rather than guessed.
+  real-world city/country/landmark or capture equipment ("drone shot",
+  lens/exposure) — it must describe generically instead ("a multi-lane
+  urban street"). Playback effects the motion itself proves (time-lapse,
+  slow motion) are allowed only on the native-video path, where they are
+  actually observable.
+- **On-screen text is NEVER transcribed.** Compressed video makes model OCR
+  confidently wrong (in testing it misread a real "KOREA ILLIES
+  ENGINEERING" sign as "KOREA MEDIA ENGINEERING"), and a caption quoting
+  misread text is a guaranteed accuracy penalty while a generic "a building
+  sign" never is — so both the report and caption prompts ban quoting any
+  sign/label/screen wording outright, no legibility exception.
 - **No upgraded poses.** An ambiguous pose is reported as the literal,
   observable position ("looking down"), not promoted into a stronger claim
   ("eyes closed", "falling asleep", "about to pounce") unless a frame shows
@@ -82,24 +90,32 @@ Track 2, which is why the pipeline spends extra calls on quality
 
 ## Pipeline stages
 
-1. **Download** with retry, `.tmp`-then-rename, and a hard wall-clock cap
-   per download (`MAX_DOWNLOAD_WALL_SECONDS`, default 150s) so a slow
-   trickling server can't eat the global budget.
-2. **Stage 1 — Scene Report** (`kimi-k2p7-code`): adaptive frame sampling —
-   one frame per ~8s, clamped to 8–16 frames, downscaled to 768px — into a
+1. **Stage 1 — Scene Report, native video** (`minimax-m3`): the task's
+   `video_url` goes straight to Fireworks (fetched server-side — no local
+   download at all) and the model watches the whole clip, producing a
    structured 10-section report (subject, environment, timeline, camera,
-   lighting, audio, mood, standout details, humor potential, RISKS).
-   Degrade chain on failure: fewer frames → `qwen3p7-plus`.
-3. **Stage 2 — Best-of-N captions** (`glm-5p2`): N=3 candidate caption sets
-   generated in parallel at temperatures 0.6/0.85/1.0, text-only from the
-   report.
-4. **Judge pass** (`qwen3p7-plus`): filters candidates to word-count-compliant
-   ones, picks the best per style, then self-critiques — any caption scoring
-   below `CRITIQUE_PASS_THRESHOLD` (8/10) is rewritten with the judge's
-   feedback, up to `MAX_CRITIQUE_RETRIES` (2) rounds, reverting if the rewrite
-   breaks the word-count rule. All judge/polish prompts carry the full
-   per-style structural rules (word counts, banned words, emoji rules).
-5. **Time budget**: clips are probed (HEAD) and scheduled heaviest-first,
+   lighting, audio, mood, standout details, humor potential, RISKS) that
+   includes real motion, continuous timelines, and camera movement.
+2. **Download — only if the frame fallback is needed** (lazy): retry,
+   `.tmp`-then-rename, and a hard wall-clock cap per download
+   (`MAX_DOWNLOAD_WALL_SECONDS`, default 150s) so a slow trickling server
+   can't eat the global budget.
+3. **Stage 1 fallback — frames** (`kimi-k2p7-code`): adaptive frame sampling —
+   one frame per ~8s, clamped to 8–16 frames, downscaled to 768px — same
+   10-section report. Degrade chain: fewer frames → `qwen3p7-plus`.
+4. **Stage 2 — Best-of-N captions** (`glm-5p2`): N=5 candidate caption sets
+   generated in parallel at temperatures 0.55/0.7/0.85/1.0/1.15, text-only
+   from the report. Style prompts lead with the official Participant Guide
+   definitions verbatim; word ranges and openings are soft craft guidance,
+   not straitjackets.
+5. **Judge pass** (`qwen3p7-plus`): prefers word-range-compliant candidates,
+   picks the best per style on the contest's two official axes (accuracy +
+   style match, with humor sharpness as the tiebreaker for humor styles),
+   then self-critiques — any caption scoring below
+   `CRITIQUE_PASS_THRESHOLD` (8/10) is rewritten with the judge's feedback,
+   up to `MAX_CRITIQUE_RETRIES` (2) rounds, reverting if the rewrite breaks
+   the word-count guard.
+6. **Time budget**: clips are probed (HEAD) and scheduled heaviest-first,
    processed with `CONCURRENCY=6`; a hard wall-clock deadline
    (`TOTAL_BUDGET_SECONDS=540`) is enforced with
    `concurrent.futures.wait(..., timeout=...)` — any clip not done in time
@@ -109,8 +125,9 @@ Track 2, which is why the pipeline spends extra calls on quality
    `os._exit(0)` at the end guarantees the process can't hang on a stuck
    thread.
 
-No audio understanding on this path (Fireworks' Whisper endpoints were
-discontinued 2026-06-10); prompts explicitly force "No audio present" so the
+No audio understanding on any path — Fireworks' Whisper endpoints were
+discontinued 2026-06-10, and `video_url` input delivers no audio track to
+the model (verified); prompts explicitly force "No audio present" so the
 models never invent sound.
 
 ## Credentials: Track 2 injects NONE — must be baked into the image
@@ -152,9 +169,10 @@ python web_demo/app.py   # http://localhost:5000
 ```
 
 Paste a clip URL (or click one of the three official example clips), pick
-styles, and watch live progress stream in — download → frame sampling/scene
-report/candidates → judge pick & self-critique — with each caption's
-word-count compliance shown as it arrives.
+styles, and watch live progress stream in — native-video scene report (the
+download step is skipped unless the frame fallback runs) → Best-of-N
+candidates → judge pick & self-critique — with each caption's word-count
+compliance shown as it arrives.
 
 ## Docker — build, test, and push
 

@@ -1,8 +1,9 @@
 """
 CaptionForge — Track 2: Video Captioning Agent
 
-Reads /input/tasks.json, for each task downloads the clip, then runs the
-Fireworks frame-based pipeline: kimi-k2p7-code scene report -> glm-5p2 writes
+Reads /input/tasks.json, then per task runs the Fireworks pipeline:
+minimax-m3 watches the WHOLE clip via video_url (no download needed; falls
+back to downloading + kimi-k2p7-code over extracted frames) -> glm-5p2 writes
 Best-of-N candidate caption sets -> qwen3p7-plus judge picks the best per
 style, polishes humor styles, and self-critiques (all model roles chosen by
 benchmark, see config.py). Writes /output/results.json. Must exit 0, must
@@ -25,7 +26,7 @@ load_dotenv()  # no-op in the real submission container (no .env bundled); used 
 import config
 from downloader import download_video, probe_size_mb
 from judge_polish import JudgeAssistant
-from prompts import in_word_range, word_count
+from prompts import has_tech_jargon, in_word_range, sanitize_caption, word_count
 
 START_TIME = time.monotonic()
 DEADLINE = START_TIME + config.TOTAL_BUDGET_SECONDS
@@ -85,7 +86,7 @@ def guarded_polish(judge: JudgeAssistant, style: str, scene: str, prompt_caption
     `baseline` is the actual current caption; `prompt_caption` may carry
     extra reviewer-feedback text and is only what gets sent to the model."""
     baseline = baseline if baseline is not None else prompt_caption
-    polished = judge.polish(style, scene, prompt_caption)
+    polished = sanitize_caption(judge.polish(style, scene, prompt_caption))
     if polished != baseline and in_word_range(style, baseline) and not in_word_range(style, polished):
         print(f"[word-guard] {style}: polish went out of range "
               f"({word_count(baseline)} -> {word_count(polished)} words) — keeping previous caption")
@@ -122,7 +123,7 @@ def order_tasks_heaviest_first(tasks: list) -> list:
     return sorted(tasks, key=lambda t: weights.get(t.get("task_id"), 0.0), reverse=True)
 
 
-def process_task(task: dict, captioner, judge: JudgeAssistant) -> dict:
+def process_task(task: dict, captioner, judge: JudgeAssistant, variety_index: int = 0) -> dict:
     task_id = task.get("task_id", "unknown")
     video_url = task.get("video_url")
     styles = task.get("styles") or sorted(config.REQUIRED_STYLES)
@@ -142,18 +143,35 @@ def process_task(task: dict, captioner, judge: JudgeAssistant) -> dict:
     print(f"[*] Starting task {task_id}...")
     t_start = time.monotonic()
     try:
-        local_path = download_video(video_url)
+        # Lazy download: the native-video path hands the URL straight to
+        # Fireworks (fetched server-side), so the multi-hundred-MB UHD file
+        # is only downloaded here if the frame fallback actually runs.
+        def ensure_downloaded() -> str:
+            nonlocal local_path
+            if local_path is None:
+                local_path = download_video(video_url)
+            return local_path
 
         # caption_clip runs the 2-stage pipeline (scene report -> Best-of-N
         # candidate caption sets) and returns the scene report alongside the
         # candidates. Do NOT store this on the shared captioner instance —
         # it's reused across worker threads, so per-call state must stay
         # local to this call.
-        candidates, scene = captioner.caption_clip(local_path, styles)
+        candidates, scene = captioner.caption_clip(ensure_downloaded, styles, video_url=video_url,
+                                                   variety_index=variety_index)
 
         final_captions = {}
         for style in styles:
             style_options = [c.get(style, "") for c in candidates if c.get(style)]
+            # humorous_non_tech is defined as having NO technical jargon, so a
+            # candidate carrying any is a style-match penalty waiting to
+            # happen — drop those before the judge can pick one.
+            if style == "humorous_non_tech":
+                clean = [o for o in style_options if not has_tech_jargon(o)]
+                if clean and len(clean) < len(style_options):
+                    print(f"[tech-guard] {style}: dropped {len(style_options) - len(clean)} "
+                          f"candidate(s) containing technical jargon")
+                style_options = clean or style_options
             # Prefer candidates that already satisfy the style's word-count
             # rule; only fall back to the full pool when none are compliant.
             compliant = [o for o in style_options if in_word_range(style, o)]
@@ -274,7 +292,15 @@ def main():
     results_by_id = {}
 
     pool = ThreadPoolExecutor(max_workers=config.CONCURRENCY)
-    futures = {pool.submit(process_task, task, captioner, judge): task for task in scheduled_tasks}
+    # variety_index comes from the task's position in the INPUT order (not the
+    # heaviest-first scheduling order) so the humorous_non_tech openings
+    # round-robin evenly and deterministically across the batch — see
+    # prompts.NON_TECH_OPENINGS.
+    futures = {
+        pool.submit(process_task, task, captioner, judge,
+                    original_order.get(task.get("task_id"), 0)): task
+        for task in scheduled_tasks
+    }
 
     # Hard rule: never wait past the global deadline (minus a finalization
     # reserve) no matter how many tasks are still running. A single stuck

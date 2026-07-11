@@ -1,19 +1,26 @@
 """
-Primary captioner: Fireworks-hosted models over extracted still frames.
+Primary captioner: Fireworks-hosted models.
 
-Two-stage pipeline, frames-only (no audio — Fireworks' Whisper endpoints
-were confirmed discontinued as of 2026-06-10):
-  Stage 1: adaptive frame sampling -> vision model (kimi-k2p7-code, benchmark
-           winner for scene reports) -> structured 10-section Scene Report.
-           Degrade chain on failure: fewer frames -> fallback vision model
-           (qwen3p7-plus) so one flaky call never costs the whole clip.
+Two-stage pipeline (no audio on any path — Fireworks' Whisper endpoints were
+confirmed discontinued as of 2026-06-10, and video_url delivers no audio):
+  Stage 1 (primary): the WHOLE clip goes to minimax-m3 via video_url —
+           Fireworks fetches the URL server-side, so no local download is
+           needed at all. Sees real motion/timelines/camera movement that
+           still frames can't. OCR is untrusted (prompt bans transcribing
+           on-screen text after it confidently misread a real sign).
+  Stage 1 (degrade chain): adaptive frame sampling -> vision model
+           (kimi-k2p7-code) full frames -> 4 frames -> 4 frames on
+           qwen3p7-plus, so one flaky model/call never costs the clip.
   Stage 2: Best-of-N — the text model (glm-5p2, benchmark winner for
            caption writing) generates N candidate caption sets in parallel
            at different temperatures; main.py has the judge model pick the
            best per style.
 
-caption_clip(video_path, styles) -> (candidates: list[dict], scene_report)
-where candidates is a non-empty list of {style: caption} dicts.
+caption_clip(video_source, styles, video_url=None)
+    -> (candidates: list[dict], scene_report)
+where candidates is a non-empty list of {style: caption} dicts and
+video_source is a local path OR a zero-arg callable returning one (called
+only if the frame fallback is actually needed — lazy download).
 """
 import base64
 import json
@@ -23,12 +30,17 @@ import tempfile
 import time
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import requests
 
 import config
-from prompts import build_caption_generation_prompt, build_frame_scene_analysis_prompt
+from prompts import (
+    build_caption_generation_prompt,
+    build_frame_scene_analysis_prompt,
+    build_native_video_scene_analysis_prompt,
+    sanitize_caption,
+)
 
 MAX_API_RETRIES = 2
 RETRY_BACKOFF_SECONDS = [3, 6]
@@ -222,12 +234,38 @@ class FireworksCaptioner:
             raise SceneAnalysisFailed(scene_report)
         return scene_report
 
-    def _generate_candidates(self, scene_report: str, styles: list, filename: str, n: int) -> list:
+    def _scene_report_native(self, video_url: str, filename: str) -> str:
+        """Stage 1 primary path: the whole clip via video_url on the
+        native-video model (minimax-m3). Fireworks fetches the URL
+        server-side — no local download involved. max_tokens is generous
+        because a real test at 800 got the report truncated mid-sentence."""
+        content: List[Dict[str, Any]] = [
+            {"type": "text", "text": build_native_video_scene_analysis_prompt()},
+            {"type": "video_url", "video_url": {"url": video_url}},
+        ]
+        print(f"[fireworks] Sending NATIVE VIDEO Scene Analysis for {filename} "
+              f"to {config.FIREWORKS_NATIVE_VIDEO_MODEL}...")
+        t0 = time.monotonic()
+        scene_report = self._chat_with_retry(
+            messages=[{"role": "user", "content": content}],
+            model=config.FIREWORKS_NATIVE_VIDEO_MODEL,
+            max_tokens=1600,
+            timeout_seconds=config.FIREWORKS_NATIVE_VIDEO_TIMEOUT_SECONDS,
+            temperature=0.3,
+        )
+        print(f"[fireworks] Native video Scene Analysis completed in {time.monotonic() - t0:.2f}s")
+        if scene_report.upper().startswith("ANALYSIS FAILED"):
+            raise SceneAnalysisFailed(scene_report)
+        return scene_report
+
+    def _generate_candidates(self, scene_report: str, styles: list, filename: str, n: int,
+                             variety_index: int = 0) -> list:
         """Stage 2 Best-of-N: n candidate caption sets in parallel at
         different temperatures. Returns every set that parsed successfully
-        (at least one, else raises the last error)."""
-        prompt2 = build_caption_generation_prompt(scene_report, styles)
-        temperatures = [0.6, 0.85, 1.0][:max(1, n)] or [0.7]
+        (at least one, else raises the last error). `variety_index` picks
+        this clip's assigned humorous_non_tech opening — see prompts.py."""
+        prompt2 = build_caption_generation_prompt(scene_report, styles, variety_index)
+        temperatures = [0.55, 0.7, 0.85, 1.0, 1.15][:max(1, n)] or [0.7]
 
         def one(temp: float):
             raw = self._chat_with_retry(
@@ -238,7 +276,9 @@ class FireworksCaptioner:
                 temperature=temp,
             )
             captions = _extract_json(raw)
-            return {s: str(captions.get(s, "")).strip() for s in styles}
+            # sanitize_caption also scrubs any prompt-instruction text the model
+            # echoed into the caption (see prompts.sanitize_caption).
+            return {s: sanitize_caption(str(captions.get(s, ""))) for s in styles}
 
         print(f"[fireworks] Generating {len(temperatures)} caption candidate set(s) for {filename} via {self.text_model}...")
         t0 = time.monotonic()
@@ -259,40 +299,63 @@ class FireworksCaptioner:
             raise last_exc or RuntimeError("all caption candidates failed")
         return candidates
 
-    def caption_clip(self, video_path: str, styles: list):
+    def caption_clip(self, video_source: Union[str, Callable[[], str]], styles: list,
+                     video_url: Optional[str] = None, variety_index: int = 0):
         """Returns (candidates: list[dict], scene_report: str). Candidates
         is a non-empty list of {style: caption} dicts — the caller picks the
         best one per style (or just uses candidates[0]).
 
-        Degrade chain for Stage 1 so a flaky model/call never costs the
-        whole clip: full frames on the primary vision model -> 4 frames on
-        the primary -> 4 frames on the fallback vision model."""
-        filename = os.path.basename(video_path)
-        with tempfile.TemporaryDirectory() as workdir:
-            duration = _probe_duration_seconds(video_path)
-            # Adaptive sampling: 1 frame per SECONDS_PER_FRAME, clamped.
-            n_frames = max(config.MIN_FRAMES_PER_CLIP,
-                           min(config.MAX_FRAMES_PER_CLIP, round(duration / config.SECONDS_PER_FRAME)))
-            frames = _extract_frames(video_path, n_frames, workdir)
+        `video_source` is a local file path OR a zero-arg callable returning
+        one. The callable is invoked only if the frame fallback is actually
+        needed, so the native-video path never waits on (or pays for) a
+        local download at all. `variety_index` is the clip's position in the
+        task list, used to assign its humorous_non_tech opening (prompts.py).
 
-            attempts = [
-                (frames, self.vision_model),
-                (frames[:: max(1, len(frames) // 4)][:4], self.vision_model),
-                (frames[:: max(1, len(frames) // 4)][:4], config.FIREWORKS_VISION_FALLBACK_MODEL),
-            ]
-            scene_report, last_exc = None, None
-            for i, (attempt_frames, model) in enumerate(attempts):
-                try:
-                    scene_report = self._scene_report(attempt_frames, duration, filename, model)
-                    break
-                except SceneAnalysisFailed:
-                    raise  # model explicitly says frames are unreadable — don't burn time retrying
-                except Exception as e:
-                    last_exc = e
-                    if i < len(attempts) - 1:
-                        print(f"[fireworks] Scene Analysis attempt {i + 1} failed ({e}) — degrading")
-            if scene_report is None:
-                raise last_exc or RuntimeError("scene analysis failed")
+        Stage 1 degrade chain so a flaky model/call never costs the clip:
+        whole clip via video_url on the native-video model -> full frames on
+        the primary vision model -> 4 frames on the primary -> 4 frames on
+        the fallback vision model. A SceneAnalysisFailed from the NATIVE
+        path also degrades to frames (Fireworks' server-side fetch can choke
+        on a stream that local ffmpeg decodes fine); once the FRAME attempts
+        report unreadable pixels we raise, as before."""
+        filename = os.path.basename(video_url or (video_source if isinstance(video_source, str) else "clip"))
+        scene_report = None
 
-        candidates = self._generate_candidates(scene_report, styles, filename, config.BEST_OF_N)
+        if config.ENABLE_NATIVE_VIDEO and video_url:
+            try:
+                scene_report = self._scene_report_native(video_url, filename)
+            except Exception as e:
+                print(f"[fireworks] Native video Scene Analysis failed ({e}) — degrading to frame analysis")
+
+        if scene_report is None:
+            local_path = video_source if isinstance(video_source, str) else video_source()
+            filename = os.path.basename(local_path)
+            with tempfile.TemporaryDirectory() as workdir:
+                duration = _probe_duration_seconds(local_path)
+                # Adaptive sampling: 1 frame per SECONDS_PER_FRAME, clamped.
+                n_frames = max(config.MIN_FRAMES_PER_CLIP,
+                               min(config.MAX_FRAMES_PER_CLIP, round(duration / config.SECONDS_PER_FRAME)))
+                frames = _extract_frames(local_path, n_frames, workdir)
+
+                attempts = [
+                    (frames, self.vision_model),
+                    (frames[:: max(1, len(frames) // 4)][:4], self.vision_model),
+                    (frames[:: max(1, len(frames) // 4)][:4], config.FIREWORKS_VISION_FALLBACK_MODEL),
+                ]
+                last_exc = None
+                for i, (attempt_frames, model) in enumerate(attempts):
+                    try:
+                        scene_report = self._scene_report(attempt_frames, duration, filename, model)
+                        break
+                    except SceneAnalysisFailed:
+                        raise  # model explicitly says frames are unreadable — don't burn time retrying
+                    except Exception as e:
+                        last_exc = e
+                        if i < len(attempts) - 1:
+                            print(f"[fireworks] Scene Analysis attempt {i + 1} failed ({e}) — degrading")
+                if scene_report is None:
+                    raise last_exc or RuntimeError("scene analysis failed")
+
+        candidates = self._generate_candidates(scene_report, styles, filename, config.BEST_OF_N,
+                                               variety_index)
         return candidates, scene_report

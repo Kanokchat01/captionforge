@@ -23,14 +23,29 @@ KEEP_DOWNLOADS = os.environ.get("KEEP_DOWNLOADS", "false").lower() == "true"
 # --- Required for the primary (base caption) pass ---
 # Model roles were chosen by a head-to-head benchmark (2026-07-11, 3 sample
 # clips, cross-judged by glm-5p1 + deepseek-v4-pro on the official rubric):
-#   Stage 1 vision  -> kimi-k2p7-code      (most detailed, meme-aware scene reports;
-#                                      verified hallucination-free vs real frames)
+#   Stage 1 eyes    -> minimax-m3     (ONLY account model that accepts whole
+#                                      videos via video_url — verified
+#                                      2026-07-11, ~4s/clip; sees motion,
+#                                      timelines, camera movement that still
+#                                      frames can't. NOT trusted for OCR: it
+#                                      confidently misread a real building
+#                                      sign, so prompts ban transcribing
+#                                      on-screen text. No audio arrives.)
+#   Stage 1 fallback-> kimi-k2p7-code      (frame-based; most detailed, meme-aware
+#                                      scene reports; hallucination-free vs
+#                                      real frames. kimi/qwen reject video_url
+#                                      with "videos limited to 0".)
 #   Stage 2 caption -> glm-5p2        (best caption writer: 0.874 vs 0.850 qwen,
-#                                      0.830 kimi-k2p7-code, 0.666 minimax-m3)
+#                                      0.830 kimi-k2p7-code, 0.666 minimax-m3 —
+#                                      minimax stays out of the WRITER role;
+#                                      it also failed JSON output on 2/3 clips)
 #   Judge/polish    -> qwen3p7-plus   (runner-up, fastest, different family from
 #                                      the writer to avoid self-preference bias)
-# minimax-m3 was dropped: it failed to emit valid JSON on 2/3 clips even with
-# response_format=json_object.
+ENABLE_NATIVE_VIDEO = os.environ.get("ENABLE_NATIVE_VIDEO", "true").lower() == "true"
+FIREWORKS_NATIVE_VIDEO_MODEL = os.environ.get("FIREWORKS_NATIVE_VIDEO_MODEL", "accounts/fireworks/models/minimax-m3")
+# Whole-clip analysis of a 2-min UHD video (Fireworks fetches the URL
+# server-side) needs more headroom than a frame call.
+FIREWORKS_NATIVE_VIDEO_TIMEOUT_SECONDS = float(os.environ.get("FIREWORKS_NATIVE_VIDEO_TIMEOUT_SECONDS", "90"))
 FIREWORKS_VISION_MODEL = os.environ.get("FIREWORKS_VISION_MODEL", "accounts/fireworks/models/kimi-k2p7-code")
 # Used when the primary vision model fails on a clip (degrade chain).
 FIREWORKS_VISION_FALLBACK_MODEL = os.environ.get("FIREWORKS_VISION_FALLBACK_MODEL", "accounts/fireworks/models/qwen3p7-plus")
@@ -59,8 +74,11 @@ FIREWORKS_JUDGE_MODEL = os.environ.get("FIREWORKS_JUDGE_MODEL", "accounts/firewo
 # still polishes any caption the judge scores under the threshold.
 ENABLE_JUDGE_POLISH = os.environ.get("ENABLE_JUDGE_POLISH", "false").lower() == "true"
 ENABLE_SELF_CRITIQUE = os.environ.get("ENABLE_SELF_CRITIQUE", "true").lower() == "true"
-# Best-of-N candidate caption sets per clip in Stage 2 (judge picks per style).
-BEST_OF_N = int(os.environ.get("BEST_OF_N", "3"))
+# Best-of-N candidate caption sets per clip in Stage 2 (judge picks per
+# style). 5 since 2026-07-11: Track 2 has no token budget and the 3-set run
+# finished 3 clips in 81s of the 540s budget, so wider sampling is free —
+# more shots at a genuinely funny line for the humor styles.
+BEST_OF_N = int(os.environ.get("BEST_OF_N", "5"))
 MAX_CRITIQUE_RETRIES = int(os.environ.get("MAX_CRITIQUE_RETRIES", "2"))
 CRITIQUE_PASS_THRESHOLD = float(os.environ.get("CRITIQUE_PASS_THRESHOLD", "8"))
 
