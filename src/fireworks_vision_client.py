@@ -44,7 +44,10 @@ from prompts import (
 )
 
 MAX_API_RETRIES = 2
-RETRY_BACKOFF_SECONDS = [3, 6]
+# Long enough tail that a 429 burst (observed live on qwen3p7-plus at ~6+
+# concurrent vision calls) is outlasted instead of falling through to the
+# spare model's voice. Only calls that opt into attempts=4+ reach the tail.
+RETRY_BACKOFF_SECONDS = [2, 5, 10, 18]
 RETRYABLE_MARKERS = ("503", "429", "unavailable", "rate limit", "resource_exhausted", "timeout", "deadline", "502", "504")
 
 
@@ -76,19 +79,20 @@ def _probe_duration_seconds(video_path: str) -> float:
         return 10.0  # unknown duration fallback — still try to grab a few frames
 
 
-def _extract_frames(video_path: str, max_frames: int, workdir: str):
+def _extract_frames(video_path: str, max_frames: int, workdir: str, max_width: int = 0):
     """Seeks to `max_frames` evenly-spaced timestamps and grabs one JPEG
     frame at each via ffmpeg. Returns a list of (timestamp_seconds, jpeg_bytes).
     Uses per-timestamp -ss seeking (accurate, one process per frame) rather
     than a single fps= filter pass — max_frames is small (default 8) so the
     extra process overhead is negligible and timestamps come out exact.
 
-    Frames are downscaled to config.FIREWORKS_FRAME_MAX_WIDTH (default
-    768px wide, aspect-preserved, never upscaled) before saving — a real
-    test against actual 1440p/4K source clips hit "write operation timed
-    out" uploading un-resized native-resolution frames; multiple multi-MB
-    JPEGs add up fast on ordinary home upload bandwidth. Downscaling first
-    fixes that at the source instead of just raising timeouts."""
+    Frames are downscaled to `max_width` (falls back to
+    config.FIREWORKS_FRAME_MAX_WIDTH, aspect-preserved, never upscaled)
+    before saving — a real test against actual 1440p/4K source clips hit
+    "write operation timed out" uploading un-resized native-resolution
+    frames; multiple multi-MB JPEGs add up fast on ordinary home upload
+    bandwidth. Downscaling first fixes that at the source instead of just
+    raising timeouts."""
     duration = _probe_duration_seconds(video_path)
     if max_frames <= 1:
         timestamps = [duration / 2.0]
@@ -100,7 +104,7 @@ def _extract_frames(video_path: str, max_frames: int, workdir: str):
         step = (span_end - span_start) / (max_frames - 1) if max_frames > 1 else 0
         timestamps = [span_start + step * i for i in range(max_frames)]
 
-    max_w = config.FIREWORKS_FRAME_MAX_WIDTH
+    max_w = max_width or config.FIREWORKS_FRAME_MAX_WIDTH
     # scale filter: shrink to max_w wide if the source is wider, otherwise
     # leave as-is (never upscale a smaller source); height auto (-2 keeps it
     # divisible by 2, which some encoders require).
@@ -127,6 +131,16 @@ def _extract_frames(video_path: str, max_frames: int, workdir: str):
     if not frames:
         raise RuntimeError("ffmpeg failed to extract any frames from this clip")
     return frames
+
+
+def extract_frames_b64(video_path: str, n_frames: int, max_width: int) -> List[str]:
+    """Exactly `n_frames` uniform frames as base64 JPEG strings, in
+    chronological order. Shared by the qwen_direct engine and
+    scripts/local_eval.py so the local judge sees the same geometry the
+    writer sees."""
+    with tempfile.TemporaryDirectory() as workdir:
+        frames = _extract_frames(video_path, n_frames, workdir, max_width=max_width)
+    return [base64.b64encode(jpeg_bytes).decode("ascii") for _, jpeg_bytes in frames]
 
 
 def _extract_json(text: str) -> dict:

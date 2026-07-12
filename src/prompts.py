@@ -599,3 +599,123 @@ def build_judge_prompt(style: str, scene_hint: str, caption: str) -> str:
         f"Scene details: {scene_hint}\n"
         f"Caption to judge: {caption}"
     )
+
+
+# =========================================================================
+# v6 qwen_direct prompts — one multimodal call per style, no describe stage.
+#
+# GEOMETRY IS LOAD-BEARING — DO NOT RESTRUCTURE. The shape (a short
+# imperative persona of ~2 sentences + one numbered rules block + the
+# literal <caption_output> tags, sent under a strict-formatter system
+# prompt at temperature ~0.7 with reasoning off) is board-verified at
+# 0.92-0.93; a rewrite to long roleplay personas, a softer system prompt,
+# and renamed tags collapsed a comparable pipeline to 0.74. Adjust wording
+# only, never the shape, and re-verify on the board after any change.
+# =========================================================================
+
+QWEN_DIRECT_SYSTEM_PROMPT = (
+    "You turn a persona brief and a set of video frames into exactly one "
+    "caption. Reply with plain English text only, and place the finished "
+    "caption inside literal <caption_output> and </caption_output> tags. "
+    "Never show your reasoning, never chat, never use markdown of any kind."
+)
+
+QWEN_DIRECT_FORMAT_RULES = (
+    "\n\n### RESPONSE FORMAT ###\n"
+    "1. Put one finished caption between <caption_output> and </caption_output> "
+    "— the tags plus the caption are your entire reply.\n"
+    "2. Write in English about what the frames visibly show; never quote "
+    "on-screen text and never name a real city, country, or landmark.\n"
+    "3. No emoji, no markdown, no notes or explanations before or after the tags."
+)
+
+QWEN_DIRECT_PERSONAS = {
+    "formal": (
+        "Caption these frames the way a wire-agency photo desk would: neutral, "
+        "precise, and strictly observational. One polished declarative sentence "
+        "stating what the footage shows — no opinion, no flourish."
+    ),
+    # sarcastic + humorous_tech: R1 wording restored verbatim — the R2 rewrite
+    # (forced brevity / single-metaphor constraint) measurably dropped their
+    # accuracy axis on the vision judge (0.937->0.897, 0.907->0.880).
+    "sarcastic": (
+        "React with dry, unimpressed sarcasm, as if this clip interrupted "
+        "something far more important. Pick one thing actually visible on "
+        "screen and mock it flatly — understatement over hype, ending on a "
+        "pointed little dig."
+    ),
+    "humorous_tech": (
+        "Crack a joke like a sleep-deprived programmer on a fifth coffee: map "
+        "what is happening on screen onto software life — crashes, updates, "
+        "lag, endless loading bars. Keep the real scene clearly recognizable "
+        "underneath the joke."
+    ),
+    # v6-r6: R1's wording invited the joke OFF screen — "warm everyday
+    # comparisons about food, chores, weather, pets, or naps" is read as an
+    # instruction to compare the clip to a kitchen, and the model kept landing
+    # on the same off-screen attractors ("the timer ding", "the cookies") on
+    # unrelated clips, which the judge scores as a claim the clip never made
+    # (accuracy 0.70). The scene itself is now the butt of the joke; the
+    # everyday register survives in the vocabulary, not in the subject.
+    "humorous_non_tech": (
+        "Joke like the funny uncle at a family dinner: in plain everyday "
+        "words, make the thing actually on screen the butt of the joke. A "
+        "comparison is fine only if it sharpens what is visible — never swap "
+        "the scene out for your kitchen, your nap, or a story about yourself. "
+        "Zero technology words, zero niche references — humor anyone's "
+        "grandmother would get."
+    ),
+}
+
+# R3 exemplars REMOVED (v6-r4a). The local vision judge loved them
+# (non_tech 0.845->0.877) but the BOARD scored the exemplar image (v6-r2)
+# at 0.80 against R1's 0.90 — the exemplar's own scene bled into captions as
+# claims the clip never showed, and the judge re-watches the clip. Kept as an
+# empty dict so the append path below stays a no-op rather than a code change.
+QWEN_DIRECT_EXEMPLARS = {}
+
+# Grounding discipline (v6-r4a): ONE constraint sentence on the humor styles.
+# It targets the same accuracy axis the exemplars were meant to lift, but via
+# a rule instead of a tempting example — the shape both 0.92 board teams use.
+# Formal is already strictly observational, so it stays untouched.
+GROUNDING_DISCIPLINE = (
+    "\nGround the joke only in what the frames actually show: you may "
+    "exaggerate a visible action, but never invent an object, place, person, "
+    "or event that is not on screen."
+)
+GROUNDED_STYLES = ("sarcastic", "humorous_tech", "humorous_non_tech")
+
+
+def build_qwen_direct_prompt(style: str) -> str:
+    persona = QWEN_DIRECT_PERSONAS.get(
+        style, f'Write one English caption for this clip in a clear "{style}" voice.')
+    exemplar = QWEN_DIRECT_EXEMPLARS.get(style)
+    if exemplar:
+        persona += (
+            "\nOne example of this register, from a DIFFERENT video — match "
+            f'its sharpness, never reuse its subject or joke: "{exemplar}"'
+        )
+    if style in GROUNDED_STYLES:
+        persona += GROUNDING_DISCIPLINE
+    return persona + QWEN_DIRECT_FORMAT_RULES
+
+
+CAPTION_TAG_RE = re.compile(r"<caption_output>\s*(.*?)\s*</caption_output>",
+                            re.DOTALL | re.IGNORECASE)
+# Truncation tolerance: opening tag present but the reply was cut off before
+# the closing tag — take everything after the opening tag, minus any partial
+# closing tag fragment at the end.
+CAPTION_TAG_OPEN_RE = re.compile(r"<caption_output>\s*(.*)$", re.DOTALL | re.IGNORECASE)
+
+
+def extract_caption_tag(raw: str) -> str:
+    """Caption text from a qwen_direct reply, or "" when no tag is present."""
+    if not raw:
+        return ""
+    m = CAPTION_TAG_RE.search(raw)
+    if m:
+        return m.group(1).strip()
+    m = CAPTION_TAG_OPEN_RE.search(raw)
+    if m:
+        return re.sub(r"</?caption[^>]*$", "", m.group(1)).strip()
+    return ""

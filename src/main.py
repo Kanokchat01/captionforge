@@ -1,15 +1,18 @@
 """
 CaptionForge — Track 2: Video Captioning Agent
 
-Reads /input/tasks.json, then per task runs the Fireworks pipeline:
-minimax-m3 watches the WHOLE clip via video_url (no download needed; falls
-back to downloading + kimi-k2p7-code over extracted frames) -> glm-5p2 writes
-Best-of-N candidate caption sets -> qwen3p7-plus judge picks the best per
-style, polishes humor styles, and self-critiques (all model roles chosen by
-benchmark, see config.py). Writes /output/results.json. Must exit 0, must
-finish within 10 minutes total, must never crash the whole run because one
-clip failed, and must never let one stuck task blow the whole container's
-time budget.
+Reads /input/tasks.json, captions every clip in each requested style, writes
+/output/results.json. Two engines, selected by config.CAPTION_ASSEMBLY:
+
+  qwen_direct (default) — uniform frames go straight to the vision model,
+      ONE multimodal call per style, deterministic code-only guards on top
+      (see qwen_direct.py). No describe stage, no judge, no critique.
+  legacy_v5 — the previous scene-report -> Best-of-N -> judge pipeline,
+      kept only for rollback.
+
+Must exit 0, must finish within 10 minutes total, must never crash the whole
+run because one clip failed, and must never let one stuck task blow the
+whole container's time budget.
 """
 import json
 import os
@@ -24,6 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()  # no-op in the real submission container (no .env bundled); used for local dev
 
 import config
+import qwen_direct
 from downloader import download_video, probe_size_mb
 from judge_polish import JudgeAssistant
 from prompts import in_word_range, sanitize_caption, style_violations, word_count
@@ -37,10 +41,11 @@ HUMOR_STYLES_FOR_POLISH = {"sarcastic", "humorous_tech", "humorous_non_tech"}
 
 
 def make_captioner():
-    """Returns the Fireworks-hosted captioner (native video primary, frame
-    fallback; no audio understanding on either path)."""
+    """Returns the Fireworks-hosted captioner. Which engine drives it is
+    decided per task by config.CAPTION_ASSEMBLY."""
     from fireworks_vision_client import FireworksCaptioner
-    print("[*] Using Fireworks native-video analysis with frame fallback (no audio understanding).")
+    print(f"[*] Caption engine: {config.CAPTION_ASSEMBLY} "
+          f"(model {config.QWEN_DIRECT_MODEL if config.CAPTION_ASSEMBLY == 'qwen_direct' else config.FIREWORKS_TEXT_MODEL})")
     return FireworksCaptioner()
 
 
@@ -156,6 +161,25 @@ def process_task(task: dict, captioner, judge: JudgeAssistant, variety_index: in
             if local_path is None:
                 local_path = download_video(video_url)
             return local_path
+
+        # v6 primary engine: frames straight to the vision model, one call
+        # per style, deterministic guards only — see qwen_direct.py.
+        if config.CAPTION_ASSEMBLY == "qwen_direct":
+            final_captions = {}
+            try:
+                final_captions = qwen_direct.caption_clip_qwen_direct(
+                    captioner, ensure_downloaded, styles, time_remaining)
+            except Exception as e:
+                print(f"[qwen-direct] task {task_id} failed wholesale: {e}")
+                traceback.print_exc()
+            # Never leave a requested style empty — a missing style scores
+            # zero for the whole clip per the official rules.
+            for style in styles:
+                final_captions[style] = final_captions.get(style) or fallback_captions(
+                    [style], "qwen_direct produced no caption")[style]
+            elapsed = time.monotonic() - t_start
+            print(f"[+] Task {task_id} completed (qwen_direct) in {elapsed:.2f}s")
+            return {"task_id": task_id, "captions": final_captions}
 
         # caption_clip runs the 2-stage pipeline (scene report -> Best-of-N
         # candidate caption sets) and returns the scene report alongside the
