@@ -44,10 +44,7 @@ from prompts import (
 )
 
 MAX_API_RETRIES = 2
-# Long enough tail that a 429 burst (observed live on qwen3p7-plus at ~6+
-# concurrent vision calls) is outlasted instead of falling through to the
-# spare model's voice. Only calls that opt into attempts=4+ reach the tail.
-RETRY_BACKOFF_SECONDS = [2, 5, 10, 18]
+RETRY_BACKOFF_SECONDS = [3, 6]
 RETRYABLE_MARKERS = ("503", "429", "unavailable", "rate limit", "resource_exhausted", "timeout", "deadline", "502", "504")
 
 

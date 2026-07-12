@@ -13,8 +13,6 @@ guards the recipe itself lacks:
   model down after retries   -> the identical call on the spare model
   everything failed          -> "" (main.py fills its never-empty fallback)
 """
-import os
-import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -29,27 +27,6 @@ from prompts import (
     sanitize_caption,
     style_violations,
 )
-
-# Deterministic length cap on top of style_violations. Catches only true
-# runaways (a 110-word ramble), not normal detail-rich captions: forcing
-# everything short measurably cost the accuracy axis (R2-4f experiment), so
-# the threshold sits well above the organic length distribution.
-LENGTH_GUARD_MAX_WORDS = 60
-
-# Cap TOTAL in-flight vision calls across all clips/styles. At clip
-# concurrency 4 x 4 styles the naive burst is 16 parallel calls, which
-# reliably trips qwen3p7-plus 429s (observed live); retries recover but some
-# captions then ship in the spare model's voice. Six lanes keeps the run fast
-# (48 calls / 6 lanes x ~6s = ~1 min) while staying under the storm threshold.
-_INFLIGHT = threading.Semaphore(int(os.environ.get("QWEN_DIRECT_MAX_INFLIGHT") or 6))
-
-
-def _guard_violations(style: str, caption: str) -> list:
-    v = style_violations(style, caption)
-    if len(caption.split()) > LENGTH_GUARD_MAX_WORDS:
-        v.append("far too long — rewrite it under 40 words, keeping the same "
-                 "joke and the same facts")
-    return v
 
 # Don't spend optional (retry/regen/spare) calls this close to the deadline —
 # an imperfect caption already in hand beats a timeout-truncated run.
@@ -82,17 +59,14 @@ def _messages(frames_b64: List[str], style: str, extra_note: str = "") -> list:
 def _call(captioner, frames_b64: List[str], style: str, model: str,
           extra_note: str = "") -> str:
     """One styled vision call -> extracted caption ("" if the tag is absent).
-    Transport-level retries (429/5xx/timeouts) live inside _chat_with_retry;
-    _INFLIGHT bounds cross-clip parallelism to stay under 429 storms."""
-    with _INFLIGHT:
-        raw = captioner._chat_with_retry(
-            messages=_messages(frames_b64, style, extra_note),
-            model=model,
-            max_tokens=config.QWEN_DIRECT_MAX_TOKENS,
-            temperature=_style_temperature(style),
-            timeout_seconds=config.QWEN_DIRECT_TIMEOUT_SECONDS,
-            attempts=4,  # outlast 429 bursts before surrendering to the spare voice
-        )
+    Transport-level retries (429/5xx/timeouts) live inside _chat_with_retry."""
+    raw = captioner._chat_with_retry(
+        messages=_messages(frames_b64, style, extra_note),
+        model=model,
+        max_tokens=config.QWEN_DIRECT_MAX_TOKENS,
+        temperature=_style_temperature(style),
+        timeout_seconds=config.QWEN_DIRECT_TIMEOUT_SECONDS,
+    )
     caption = extract_caption_tag(raw)
     if not caption:
         print(f"[qwen-direct] {style}: no <caption_output> tag in reply: {raw[:160]!r}")
@@ -128,10 +102,10 @@ def _caption_one_style(captioner, frames_b64: List[str], style: str,
         return caption
 
     # Guard level 1: deterministic cleanup + at most ONE violation-driven
-    # regeneration (style rules + length cap). Keep the regenerated caption
-    # only if it actually fixes the violations without introducing new ones.
+    # regeneration. Keep the regenerated caption only if it actually fixes
+    # the violations without introducing new ones.
     caption = sanitize_caption(caption)
-    violations = _guard_violations(style, caption)
+    violations = style_violations(style, caption)
     if violations and clock_allows():
         note = ("Your previous caption had these problems: "
                 f"{'; '.join(violations)} — fix exactly these.")
@@ -139,7 +113,7 @@ def _caption_one_style(captioner, frames_b64: List[str], style: str,
         try:
             regenerated = sanitize_caption(
                 _call(captioner, frames_b64, style, config.QWEN_DIRECT_MODEL, extra_note=note))
-            if regenerated and not _guard_violations(style, regenerated):
+            if regenerated and not style_violations(style, regenerated):
                 caption = regenerated
         except Exception as e:
             print(f"[qwen-direct] {style}: regeneration failed ({e}) — keeping original")
