@@ -31,6 +31,10 @@ ENV FIREWORKS_API_KEY=${FIREWORKS_API_KEY}
 
 # --- v6 engine knobs (baked per submission rung; empty string = default) ---
 ARG CAPTION_ASSEMBLY="qwen_direct"
+# Empty = config default (qwen3p7-plus). Baked for the minimax model-swap
+# rung (E1): --build-arg QWEN_DIRECT_MODEL=accounts/fireworks/models/minimax-m3
+ARG QWEN_DIRECT_MODEL=""
+ENV QWEN_DIRECT_MODEL=${QWEN_DIRECT_MODEL}
 ARG QWEN_DIRECT_GUARD_LEVEL="1"
 ARG QWEN_DIRECT_FRAMES="4"
 ARG QWEN_DIRECT_TEMP_FORMAL=""

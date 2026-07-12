@@ -122,8 +122,10 @@ REQUIRED_STYLES = {"formal", "sarcastic", "humorous_tech", "humorous_non_tech"}
 #       No describe stage, no Best-of-N, no judge, no critique.
 #   legacy_v5 — the previous scene-report -> Best-of-N -> judge pipeline
 #       (kept for rollback only).
+#   minimax_single — ONE multimodal call per clip returning all four styles
+#       as a JSON object (the shape both 0.91 board teams run on minimax-m3).
 CAPTION_ASSEMBLY = (os.environ.get("CAPTION_ASSEMBLY") or "qwen_direct").strip().lower()
-if CAPTION_ASSEMBLY not in ("qwen_direct", "legacy_v5"):
+if CAPTION_ASSEMBLY not in ("qwen_direct", "legacy_v5", "minimax_single"):
     print(f"[config] unknown CAPTION_ASSEMBLY={CAPTION_ASSEMBLY!r} — using qwen_direct")
     CAPTION_ASSEMBLY = "qwen_direct"
 
@@ -150,6 +152,25 @@ QWEN_DIRECT_GUARD_LEVEL = _env_int("QWEN_DIRECT_GUARD_LEVEL", 1)
 def _qd_style_temp(style: str):
     v = os.environ.get(f"QWEN_DIRECT_TEMP_{style.upper()}", "")
     return float(v) if v else None
+
+
+# --- minimax_single engine: one JSON call per clip, all four styles ---
+# Frame policy is adaptive (one frame per ~5s of clip, clamped): 4 frames
+# under-sample long clips, while SwiftCap's 1fps would explode to 300 frames
+# on a 300s clip. VeloCap ran 24 @ 640px on the board, so 8-24 @ 640px stays
+# inside proven territory.
+MINIMAX_SINGLE_MODEL = os.environ.get("MINIMAX_SINGLE_MODEL") or "accounts/fireworks/models/minimax-m3"
+MINIMAX_SINGLE_FRAME_MAX_WIDTH = _env_int("MINIMAX_SINGLE_FRAME_MAX_WIDTH", 640)
+MINIMAX_SINGLE_MIN_FRAMES = _env_int("MINIMAX_SINGLE_MIN_FRAMES", 8)
+MINIMAX_SINGLE_MAX_FRAMES = _env_int("MINIMAX_SINGLE_MAX_FRAMES", 24)
+MINIMAX_SINGLE_SECONDS_PER_FRAME = float(os.environ.get("MINIMAX_SINGLE_SECONDS_PER_FRAME") or 5)
+# One reply carries four captions plus JSON overhead — 400 tokens/style is
+# the qwen_direct budget, so 1600 covers the set with headroom.
+MINIMAX_SINGLE_MAX_TOKENS = _env_int("MINIMAX_SINGLE_MAX_TOKENS", 1600)
+MINIMAX_SINGLE_TEMPERATURE = float(os.environ.get("MINIMAX_SINGLE_TEMPERATURE") or 0.7)
+# Up to 24 frames upload + a 4-caption reply needs more room than the 45s
+# single-style calls get.
+MINIMAX_SINGLE_TIMEOUT_SECONDS = float(os.environ.get("MINIMAX_SINGLE_TIMEOUT_SECONDS") or 75)
 
 
 # Optional per-style temperature overrides (experiment R2: formal cold,

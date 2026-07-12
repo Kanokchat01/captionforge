@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()  # no-op in the real submission container (no .env bundled); used for local dev
 
 import config
+import minimax_single
 import qwen_direct
 from downloader import download_video, probe_size_mb
 from judge_polish import JudgeAssistant
@@ -44,8 +45,11 @@ def make_captioner():
     """Returns the Fireworks-hosted captioner. Which engine drives it is
     decided per task by config.CAPTION_ASSEMBLY."""
     from fireworks_vision_client import FireworksCaptioner
-    print(f"[*] Caption engine: {config.CAPTION_ASSEMBLY} "
-          f"(model {config.QWEN_DIRECT_MODEL if config.CAPTION_ASSEMBLY == 'qwen_direct' else config.FIREWORKS_TEXT_MODEL})")
+    engine_model = {
+        "qwen_direct": config.QWEN_DIRECT_MODEL,
+        "minimax_single": config.MINIMAX_SINGLE_MODEL,
+    }.get(config.CAPTION_ASSEMBLY, config.FIREWORKS_TEXT_MODEL)
+    print(f"[*] Caption engine: {config.CAPTION_ASSEMBLY} (model {engine_model})")
     return FireworksCaptioner()
 
 
@@ -179,6 +183,25 @@ def process_task(task: dict, captioner, judge: JudgeAssistant, variety_index: in
                     [style], "qwen_direct produced no caption")[style]
             elapsed = time.monotonic() - t_start
             print(f"[+] Task {task_id} completed (qwen_direct) in {elapsed:.2f}s")
+            return {"task_id": task_id, "captions": final_captions}
+
+        # minimax_single engine: ONE multimodal call returns all four styles
+        # as a JSON object, guards + rescue on top — see minimax_single.py.
+        if config.CAPTION_ASSEMBLY == "minimax_single":
+            final_captions = {}
+            try:
+                final_captions = minimax_single.caption_clip_minimax_single(
+                    captioner, ensure_downloaded, styles, time_remaining)
+            except Exception as e:
+                print(f"[minimax-single] task {task_id} failed wholesale: {e}")
+                traceback.print_exc()
+            # Never leave a requested style empty — a missing style scores
+            # zero for the whole clip per the official rules.
+            for style in styles:
+                final_captions[style] = final_captions.get(style) or fallback_captions(
+                    [style], "minimax_single produced no caption")[style]
+            elapsed = time.monotonic() - t_start
+            print(f"[+] Task {task_id} completed (minimax_single) in {elapsed:.2f}s")
             return {"task_id": task_id, "captions": final_captions}
 
         # caption_clip runs the 2-stage pipeline (scene report -> Best-of-N

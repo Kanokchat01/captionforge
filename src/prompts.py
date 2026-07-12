@@ -681,3 +681,56 @@ def extract_caption_tag(raw: str) -> str:
     if m:
         return re.sub(r"</?caption[^>]*$", "", m.group(1)).strip()
     return ""
+
+
+# =========================================================================
+# minimax_single prompts — ONE multimodal call per clip, all four styles
+# returned together as a single JSON object. This call geometry (frames +
+# one instruction block -> {"formal": ..., "sarcastic": ..., ...}) is the
+# shape both 0.91 board teams run on minimax-m3: SwiftCap (1fps frames,
+# 12-35 words per caption) and VeloCap (24 frames @640px, overlap guard).
+# The per-style voices are the r1 qwen_direct personas verbatim — only the
+# packaging changes, never the registers.
+# =========================================================================
+
+MINIMAX_SINGLE_SYSTEM_PROMPT = (
+    "You are an expert video captioner. You turn a set of video frames into "
+    "caption text. Reply with ONLY one valid JSON object — no markdown "
+    "fences, no commentary, no reasoning, nothing before or after it."
+)
+
+
+def build_minimax_single_prompt(styles: list, n_frames: int, extra_note: str = "") -> str:
+    """One instruction block asking for every requested style at once.
+    `extra_note` carries the validation feedback on the single stricter
+    retry and must stay one appended sentence."""
+    style_lines = "\n".join(
+        '- "{}": {}'.format(
+            s, QWEN_DIRECT_PERSONAS.get(
+                s, f'Write one English caption for this clip in a clear "{s}" voice.'))
+        for s in styles
+    )
+    keys = ", ".join(f'"{s}"' for s in styles)
+    text = (
+        f"You are shown {n_frames} frames sampled evenly across ONE video "
+        "clip, in chronological order — treat them as a single continuous "
+        "scene, not separate images.\n\n"
+        "Write ONE caption per requested style below. Every caption must:\n"
+        "- Describe only what the frames visibly show. Never invent an "
+        "object, place, person, sound, or event that is not on screen, and "
+        "never guess at names, brands, or occupations.\n"
+        "- Never quote or transcribe on-screen text, and never name a real "
+        "city, country, or landmark.\n"
+        "- Be 12-35 words long (1-2 sentences), in English, with no emoji "
+        "and no markdown.\n"
+        "- Sound unmistakably like its assigned style — a reader should "
+        "tell the styles apart without seeing the labels.\n"
+        "- Be genuinely distinct from the other captions: never reuse the "
+        "same opening words, sentence structure, or joke across styles.\n\n"
+        f"Styles to produce:\n{style_lines}\n\n"
+        f"Return ONLY a valid JSON object with EXACT keys: [{keys}]. "
+        "Each value is one finished caption string."
+    )
+    if extra_note:
+        text += "\n" + extra_note
+    return text
