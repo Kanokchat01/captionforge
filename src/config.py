@@ -46,6 +46,15 @@ FIREWORKS_NATIVE_VIDEO_MODEL = os.environ.get("FIREWORKS_NATIVE_VIDEO_MODEL", "a
 # Whole-clip analysis of a 2-min UHD video (Fireworks fetches the URL
 # server-side) needs more headroom than a frame call.
 FIREWORKS_NATIVE_VIDEO_TIMEOUT_SECONDS = float(os.environ.get("FIREWORKS_NATIVE_VIDEO_TIMEOUT_SECONDS", "90"))
+# Stage 1.5: after the native scene report, re-attach the video and have the
+# model verify its own report, deleting claims it can't confirm (PADAYON-style
+# self-correction). Single attempt, sanity-gated, falls back to the unverified
+# report on any failure — it can only remove hallucinations, never add them.
+ENABLE_REPORT_VERIFICATION = os.environ.get("ENABLE_REPORT_VERIFICATION", "true").lower() == "true"
+FIREWORKS_VERIFY_TIMEOUT_SECONDS = float(os.environ.get("FIREWORKS_VERIFY_TIMEOUT_SECONDS", "45"))
+# Skip the verification pass when the global clock is this low — captions from
+# an unverified report still beat fallback captions from a timed-out clip.
+VERIFY_MIN_TIME_REMAINING_SECONDS = float(os.environ.get("VERIFY_MIN_TIME_REMAINING_SECONDS", "180"))
 FIREWORKS_VISION_MODEL = os.environ.get("FIREWORKS_VISION_MODEL", "accounts/fireworks/models/kimi-k2p7-code")
 # Used when the primary vision model fails on a clip (degrade chain).
 FIREWORKS_VISION_FALLBACK_MODEL = os.environ.get("FIREWORKS_VISION_FALLBACK_MODEL", "accounts/fireworks/models/qwen3p7-plus")

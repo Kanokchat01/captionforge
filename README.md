@@ -55,15 +55,22 @@ this task:
 - **Sarcastic stays dry.** Tuned to the official spec ("dry, ironic, lightly
   mocking") — deadpan understatement, not hype slang.
 
-On top of the prompts, `src/main.py` enforces two rules in code (zero extra
+On top of the prompts, `src/main.py` enforces the rules in code (zero extra
 API cost):
 
+- **Style validators** (`prompts.style_violations`) — deterministic checks
+  drop Best-of-N candidates that mechanically break their style before the
+  judge ranks them: any emoji, any non-English characters, "!" in formal,
+  hype/laughing interjections in sarcastic, technical jargon in
+  humorous_non_tech, and a *missing* tech term in humorous_tech. If the
+  final caption still violates after critique, one deterministic repair
+  polish runs, kept only if it actually fixes the problem.
 - **Word-count guard** — Best-of-N candidates are pre-filtered to the
   style's required word range before the judge picks; a self-critique polish
   that would push an in-range caption *out* of range is automatically
   reverted (`guarded_polish`).
 - **Style-conformant fallbacks** — if a clip fails, every style still gets a
-  generic caption that obeys its own word-count/emoji rules
+  generic caption that obeys its own style rules
   (`FALLBACK_CAPTION_BY_STYLE`), instead of an "unavailable" message that
   would score zero on both accuracy and style match.
 
@@ -95,7 +102,12 @@ Track 2, which is why the pipeline spends extra calls on quality
    download at all) and the model watches the whole clip, producing a
    structured 10-section report (subject, environment, timeline, camera,
    lighting, audio, mood, standout details, humor potential, RISKS) that
-   includes real motion, continuous timelines, and camera movement.
+   includes real motion, continuous timelines, camera movement, counts,
+   colors, and spatial layout. **Stage 1.5 — self-verification**: the model
+   then re-watches the clip alongside its own report and deletes or softens
+   every claim it cannot confirm (single attempt, sanity-gated, skipped when
+   the global clock runs low) — hallucinations get removed before any
+   caption is written.
 2. **Download — only if the frame fallback is needed** (lazy): retry,
    `.tmp`-then-rename, and a hard wall-clock cap per download
    (`MAX_DOWNLOAD_WALL_SECONDS`, default 150s) so a slow trickling server
@@ -106,8 +118,11 @@ Track 2, which is why the pipeline spends extra calls on quality
 4. **Stage 2 — Best-of-N captions** (`glm-5p2`): N=5 candidate caption sets
    generated in parallel at temperatures 0.55/0.7/0.85/1.0/1.15, text-only
    from the report. Style prompts lead with the official Participant Guide
-   definitions verbatim; word ranges and openings are soft craft guidance,
-   not straitjackets.
+   definitions verbatim, then anchor each style to a persona (news reporter /
+   exhausted observer / burnt-out engineer / relative who never owned a
+   smartphone) and require every caption to embed multiple concrete visual
+   facts from the report — fact-dense captions score higher on the accuracy
+   axis than short generic ones.
 5. **Judge pass** (`qwen3p7-plus`): prefers word-range-compliant candidates,
    picks the best per style on the contest's two official axes (accuracy +
    style match, with humor sharpness as the tiebreaker for humor styles),
