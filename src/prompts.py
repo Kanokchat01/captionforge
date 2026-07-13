@@ -662,6 +662,27 @@ def build_qwen_direct_prompt(style: str) -> str:
     return persona + QWEN_DIRECT_FORMAT_RULES
 
 
+# Last-ditch rescue (v7): the vision calls for THIS style all failed, but a
+# sibling style captioned the same clip successfully. Its caption is the only
+# ground truth we still hold, so re-voice its facts rather than shipping a
+# generic fallback that describes no clip at all. Text-only — no frames, so it
+# lands in ~2s even while the vision endpoint is throttling us.
+def build_sibling_rescue_prompt(style: str, source_caption: str) -> str:
+    persona = QWEN_DIRECT_PERSONAS.get(
+        style, f'Write one English caption for this clip in a clear "{style}" voice.')
+    return (
+        "Another writer already captioned this video clip. Their caption is the "
+        "only record you have of what the footage shows — you cannot see the "
+        "frames yourself.\n\n"
+        f'Their caption: "{source_caption}"\n\n'
+        "Rewrite the SAME clip in the voice described below. Keep every concrete "
+        "fact they reported (subjects, setting, actions) and invent nothing they "
+        "did not mention — you have no way to verify anything else.\n\n"
+        + persona
+        + QWEN_DIRECT_FORMAT_RULES
+    )
+
+
 CAPTION_TAG_RE = re.compile(r"<caption_output>\s*(.*?)\s*</caption_output>",
                             re.DOTALL | re.IGNORECASE)
 # Truncation tolerance: opening tag present but the reply was cut off before

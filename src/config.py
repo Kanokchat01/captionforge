@@ -154,6 +154,67 @@ def _qd_style_temp(style: str):
     return float(v) if v else None
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() == "true"
+
+
+# --- v7 hardening: failure-path only ---
+# The r1 caption geometry scored 0.90 on the board; r6 changed prompts AND
+# call timing together and scored 0.69, which decomposes cleanly as ~4 of 12
+# clips falling through to the generic fallback (style credit only, zero
+# accuracy). None of the guards below touch the happy path: they only fire
+# after a call has already failed, or they shift WHEN a call starts, never
+# what it contains. Each is independently switchable so a bad one can be
+# turned off without rebuilding the image.
+
+# Add randomness to the retry backoff so 24 sibling calls that were rate-
+# limited together don't all wake up and re-collide on the same 429 wall
+# (VeloCap runs the same trick).
+HARDEN_RETRY_JITTER = _env_bool("HARDEN_RETRY_JITTER", True)
+RETRY_JITTER_SECONDS = float(os.environ.get("RETRY_JITTER_SECONDS") or 0.4)
+# Never sleep into a retry that cannot possibly complete before the global
+# deadline — burning 6s of backoff to start a doomed call is how a clip ends
+# up on the zero-accuracy fallback. Requires this much clock for the retry
+# itself, on top of the backoff delay.
+HARDEN_RETRY_CLOCK_AWARE = _env_bool("HARDEN_RETRY_CLOCK_AWARE", True)
+RETRY_MIN_CALL_SECONDS = float(os.environ.get("RETRY_MIN_CALL_SECONDS") or 10)
+
+# CONCURRENCY clips x 4 styles = up to 24 vision calls firing in the same
+# instant at t=0. Stagger the clip starts so the batch ramps instead of
+# spiking. NOT a concurrency cap: r6 capped in-flight calls at 3 and that is
+# exactly what starved the run. This only delays the START of later clips.
+HARDEN_START_STAGGER = _env_bool("HARDEN_START_STAGGER", True)
+START_STAGGER_SECONDS = float(os.environ.get("START_STAGGER_SECONDS") or 0.35)
+START_STAGGER_MAX_SECONDS = float(os.environ.get("START_STAGGER_MAX_SECONDS") or 2.0)
+
+# Last-ditch rungs before the generic fallback (which scores ~0 on accuracy).
+# A: retry a style with a single frame — a quarter of the payload, so it can
+#    still land when the full 4-frame call keeps timing out.
+# B: if any style succeeded for this clip, rewrite ITS facts into the missing
+#    styles with a text-only call. Real facts in the right register beat a
+#    generic caption that says nothing about the clip.
+HARDEN_EMERGENCY_FRAME = _env_bool("HARDEN_EMERGENCY_FRAME", True)
+EMERGENCY_FRAME_TIMEOUT_SECONDS = float(os.environ.get("EMERGENCY_FRAME_TIMEOUT_SECONDS") or 15)
+EMERGENCY_FRAME_MIN_TIME_REMAINING = float(os.environ.get("EMERGENCY_FRAME_MIN_TIME_REMAINING") or 20)
+
+HARDEN_SIBLING_RESCUE = _env_bool("HARDEN_SIBLING_RESCUE", True)
+SIBLING_RESCUE_TIMEOUT_SECONDS = float(os.environ.get("SIBLING_RESCUE_TIMEOUT_SECONDS") or 20)
+SIBLING_RESCUE_MIN_TIME_REMAINING = float(os.environ.get("SIBLING_RESCUE_MIN_TIME_REMAINING") or 25)
+
+# The worst outcome in the whole pipeline: the download fails, so no style
+# gets frames, the clip fails wholesale, and all four captions come back
+# generic (~0 accuracy — a whole clip's score, gone). ffmpeg can seek into an
+# HTTP URL with range requests and pull our 4 frames without ever fetching the
+# whole file, so a dead download stops costing the clip. Fires ONLY after
+# download_video() has exhausted its own retries; the happy path never reaches
+# it. (This is the one thing VeloCap/SwiftCap do that we don't — but they
+# stream by default, where we only stream to survive.)
+HARDEN_URL_FRAME_FALLBACK = _env_bool("HARDEN_URL_FRAME_FALLBACK", True)
+
+
 # --- minimax_single engine: one JSON call per clip, all four styles ---
 # Frame policy is adaptive (one frame per ~5s of clip, clamped): 4 frames
 # under-sample long clips, while SwiftCap's 1fps would explode to 300 frames

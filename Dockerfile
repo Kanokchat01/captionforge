@@ -49,18 +49,18 @@ ENV CAPTION_ASSEMBLY=${CAPTION_ASSEMBLY} \
     QWEN_DIRECT_TEMP_HUMOROUS_TECH=${QWEN_DIRECT_TEMP_HUMOROUS_TECH} \
     QWEN_DIRECT_TEMP_HUMOROUS_NON_TECH=${QWEN_DIRECT_TEMP_HUMOROUS_NON_TECH}
 
-# 24 parallel vision calls (6 clips x 4 styles) risk 429 clustering; 4x4=16
-# keeps well under it and the engine is fast enough (~10s/clip) that the
-# 540s budget still clears with huge headroom.
+# 6 clips x 4 styles = 24 parallel vision calls, which clusters into 429s;
+# 4x4=16 keeps under it and the engine is fast enough (~10s/clip) that the
+# 540s budget still clears with huge headroom. This is the value baked into
+# the board-verified 0.90 image — do not change it without a board re-verify.
 ENV CONCURRENCY="4"
 
-# Hard cap on TOTAL in-flight vision calls (qwen_direct._INFLIGHT). The module
-# default of 6 sits exactly ON the observed qwen3p7-plus 429-storm threshold:
-# a 15-clip run at 6 lanes burned through all transport retries on 6 of 60
-# captions and shipped them in the SPARE model's voice (kimi), which costs
-# both axes. Three lanes removed that entirely. The run is nowhere near the
-# clock: 113s of the 540s budget at 6 lanes, ~200s at 3 — still 300s of slack.
-ENV QWEN_DIRECT_MAX_INFLIGHT="3"
+# NOTE: there is deliberately no QWEN_DIRECT_MAX_INFLIGHT here. r6 added a
+# global semaphore capping TOTAL in-flight vision calls at 3 while the
+# pipeline wants 16, which serialized the run on the (slower) judge box until
+# clips hit the time cutoff and shipped generic fallbacks. Throttling the
+# START of clips is safe (HARDEN_START_STAGGER); capping steady-state
+# throughput is not. Do not reintroduce it.
 
 # No CLI args: the harness runs the container, main.py reads /input/tasks.json
 # and writes /output/results.json on its own, then exits 0.

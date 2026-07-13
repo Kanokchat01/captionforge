@@ -23,6 +23,7 @@ from fireworks_vision_client import extract_frames_b64
 from prompts import (
     QWEN_DIRECT_SYSTEM_PROMPT,
     build_qwen_direct_prompt,
+    build_sibling_rescue_prompt,
     extract_caption_tag,
     sanitize_caption,
     style_violations,
@@ -57,7 +58,7 @@ def _messages(frames_b64: List[str], style: str, extra_note: str = "") -> list:
 
 
 def _call(captioner, frames_b64: List[str], style: str, model: str,
-          extra_note: str = "") -> str:
+          extra_note: str = "", timeout_seconds: float = 0.0) -> str:
     """One styled vision call -> extracted caption ("" if the tag is absent).
     Transport-level retries (429/5xx/timeouts) live inside _chat_with_retry."""
     raw = captioner._chat_with_retry(
@@ -65,12 +66,44 @@ def _call(captioner, frames_b64: List[str], style: str, model: str,
         model=model,
         max_tokens=config.QWEN_DIRECT_MAX_TOKENS,
         temperature=_style_temperature(style),
-        timeout_seconds=config.QWEN_DIRECT_TIMEOUT_SECONDS,
+        timeout_seconds=timeout_seconds or config.QWEN_DIRECT_TIMEOUT_SECONDS,
     )
     caption = extract_caption_tag(raw)
     if not caption:
         print(f"[qwen-direct] {style}: no <caption_output> tag in reply: {raw[:160]!r}")
     return caption
+
+
+def _emergency_frame_call(captioner, frames_b64: List[str], style: str) -> str:
+    """Rung A. Every full call for this style has failed. Retry with a SINGLE
+    mid-clip frame: a quarter of the upload and a short timeout, so it can
+    still land while the endpoint is throttling or the clock is nearly out.
+    A thin caption that describes the real clip beats a generic fallback that
+    describes nothing (accuracy is scored against the video, not fluency)."""
+    if not frames_b64:
+        return ""
+    mid = [frames_b64[len(frames_b64) // 2]]
+    print(f"[qwen-direct] {style}: emergency single-frame call")
+    return _call(captioner, mid, style, config.QWEN_DIRECT_MODEL,
+                 timeout_seconds=config.EMERGENCY_FRAME_TIMEOUT_SECONDS)
+
+
+def _sibling_rescue(captioner, style: str, source_caption: str) -> str:
+    """Rung B. No vision call for this style survived, but a sibling style
+    captioned the same clip. Re-voice its facts with a text-only call — no
+    frames, so it returns in ~2s even when the vision path is unusable."""
+    print(f"[qwen-direct] {style}: sibling rescue from a successful style")
+    raw = captioner._chat_with_retry(
+        messages=[
+            {"role": "system", "content": QWEN_DIRECT_SYSTEM_PROMPT},
+            {"role": "user", "content": build_sibling_rescue_prompt(style, source_caption)},
+        ],
+        model=config.QWEN_DIRECT_MODEL,
+        max_tokens=config.QWEN_DIRECT_MAX_TOKENS,
+        temperature=_style_temperature(style),
+        timeout_seconds=config.SIBLING_RESCUE_TIMEOUT_SECONDS,
+    )
+    return extract_caption_tag(raw)
 
 
 def _caption_one_style(captioner, frames_b64: List[str], style: str,
@@ -98,6 +131,14 @@ def _caption_one_style(captioner, frames_b64: List[str], style: str,
         except Exception as e:
             print(f"[qwen-direct] {style}: spare model failed ({e})")
 
+    # Rung A: both models refused the full frame set — try a single frame.
+    if (not caption and config.HARDEN_EMERGENCY_FRAME
+            and time_remaining() > config.EMERGENCY_FRAME_MIN_TIME_REMAINING):
+        try:
+            caption = _emergency_frame_call(captioner, frames_b64, style)
+        except Exception as e:
+            print(f"[qwen-direct] {style}: emergency frame call failed ({e})")
+
     if not caption or config.QWEN_DIRECT_GUARD_LEVEL < 1:
         return caption
 
@@ -122,13 +163,24 @@ def _caption_one_style(captioner, frames_b64: List[str], style: str,
 
 def caption_clip_qwen_direct(captioner, ensure_downloaded: Callable[[], str],
                              styles: List[str],
-                             time_remaining: Callable[[], float]) -> Dict[str, str]:
+                             time_remaining: Callable[[], float],
+                             video_url: str = "") -> Dict[str, str]:
     """All requested styles for one clip, in parallel. A single style's
     failure returns "" for that style only; raises only when the frames
     stage itself fails (caller falls back for the whole clip)."""
-    local_path = ensure_downloaded()
+    try:
+        source = ensure_downloaded()
+    except Exception as e:
+        # Losing the download used to lose the entire clip — four generic
+        # captions, zero accuracy. ffmpeg can range-request the same 4 frames
+        # straight out of the URL, so try that before giving the clip up.
+        if not (config.HARDEN_URL_FRAME_FALLBACK and video_url):
+            raise
+        print(f"[qwen-direct] download failed ({e}) — reading frames directly from the URL")
+        source = video_url
+
     t0 = time.monotonic()
-    frames_b64 = extract_frames_b64(local_path, config.QWEN_DIRECT_FRAMES,
+    frames_b64 = extract_frames_b64(source, config.QWEN_DIRECT_FRAMES,
                                     config.QWEN_DIRECT_FRAME_MAX_WIDTH)
     print(f"[qwen-direct] {len(frames_b64)} frames @{config.QWEN_DIRECT_FRAME_MAX_WIDTH}px "
           f"in {time.monotonic() - t0:.2f}s")
@@ -143,4 +195,26 @@ def caption_clip_qwen_direct(captioner, ensure_downloaded: Callable[[], str],
             except Exception:
                 print(f"[qwen-direct] {style}: unexpected failure:\n{traceback.format_exc()}")
                 results[style] = ""
+
+    # Rung B: any style still empty gets re-voiced from a style that DID land,
+    # so the clip's real facts survive even when its own vision calls didn't.
+    # Only the generic fallback (accuracy ~0) remains below this.
+    missing = [s for s in styles if not results.get(s)]
+    donor = next((results[s] for s in styles if results.get(s)), "")
+    if (missing and donor and config.HARDEN_SIBLING_RESCUE
+            and time_remaining() > config.SIBLING_RESCUE_MIN_TIME_REMAINING):
+        with ThreadPoolExecutor(max_workers=len(missing)) as pool:
+            rescues = {pool.submit(_sibling_rescue, captioner, s, donor): s for s in missing}
+            for future, style in rescues.items():
+                try:
+                    rescued = sanitize_caption(future.result())
+                    if rescued:
+                        results[style] = rescued
+                except Exception as e:
+                    print(f"[qwen-direct] {style}: sibling rescue failed ({e})")
+
+    landed = [s for s in styles if results.get(s)]
+    if len(landed) < len(styles):
+        print(f"[qwen-direct] {len(landed)}/{len(styles)} styles captioned — "
+              f"generic fallback for: {', '.join(s for s in styles if not results.get(s))}")
     return results

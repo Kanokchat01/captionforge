@@ -24,6 +24,7 @@ only if the frame fallback is actually needed — lazy download).
 """
 import base64
 import json
+import random
 import re
 import subprocess
 import tempfile
@@ -44,13 +45,44 @@ from prompts import (
 )
 
 MAX_API_RETRIES = 2
+# Deliberately unchanged from r1 (board 0.90). r6 stretched this to
+# [2, 5, 10, 18] with a 4th attempt and the extra dead time helped push ~4
+# clips onto the fallback. Jitter is added on top at call time; the base
+# schedule stays put.
 RETRY_BACKOFF_SECONDS = [3, 6]
 RETRYABLE_MARKERS = ("503", "429", "unavailable", "rate limit", "resource_exhausted", "timeout", "deadline", "502", "504")
+
+# Injected by main.py so the retry loop can see the global run deadline.
+# Left as None by local scripts and the web demo, in which case retries
+# behave exactly as they did in r1.
+_time_remaining: Optional[Callable[[], float]] = None
+
+
+def set_time_remaining(fn: Optional[Callable[[], float]]) -> None:
+    global _time_remaining
+    _time_remaining = fn
 
 
 def _is_retryable(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(marker in msg for marker in RETRYABLE_MARKERS)
+
+
+def _retry_delay(attempt: int) -> float:
+    delay = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
+    if config.HARDEN_RETRY_JITTER:
+        delay += random.random() * config.RETRY_JITTER_SECONDS
+    return delay
+
+
+def _retry_fits_clock(delay: float) -> bool:
+    """False when sleeping `delay` would leave too little time for the retry
+    it is waiting on to actually finish. Raising immediately hands the clock
+    back to the caller's cheaper rescue rungs instead of spending it on a
+    call that cannot land."""
+    if not config.HARDEN_RETRY_CLOCK_AWARE or _time_remaining is None:
+        return True
+    return _time_remaining() - delay > config.RETRY_MIN_CALL_SECONDS
 
 
 class SceneAnalysisFailed(Exception):
@@ -215,9 +247,15 @@ class FireworksCaptioner:
             except Exception as e:
                 last_exc = e
                 if attempt < total_attempts - 1 and _is_retryable(e):
-                    delay = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
+                    delay = _retry_delay(attempt)
+                    if not _retry_fits_clock(delay):
+                        left = _time_remaining() if _time_remaining else 0.0
+                        print(f"[retry] skipping retry {attempt + 2}/{total_attempts} — "
+                              f"{left:.0f}s left cannot absorb {delay:.1f}s backoff "
+                              f"+ the call: {e}")
+                        raise
                     print(f"[retry] transient Fireworks vision error (attempt {attempt + 1}/{total_attempts}, "
-                          f"waiting {delay}s): {e}")
+                          f"waiting {delay:.1f}s): {e}")
                     time.sleep(delay)
                     continue
                 raise

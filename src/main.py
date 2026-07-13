@@ -44,12 +44,15 @@ HUMOR_STYLES_FOR_POLISH = {"sarcastic", "humorous_tech", "humorous_non_tech"}
 def make_captioner():
     """Returns the Fireworks-hosted captioner. Which engine drives it is
     decided per task by config.CAPTION_ASSEMBLY."""
-    from fireworks_vision_client import FireworksCaptioner
+    from fireworks_vision_client import FireworksCaptioner, set_time_remaining
     engine_model = {
         "qwen_direct": config.QWEN_DIRECT_MODEL,
         "minimax_single": config.MINIMAX_SINGLE_MODEL,
     }.get(config.CAPTION_ASSEMBLY, config.FIREWORKS_TEXT_MODEL)
     print(f"[*] Caption engine: {config.CAPTION_ASSEMBLY} (model {engine_model})")
+    # Let the transport layer see the global clock so it never sleeps into a
+    # backoff whose retry cannot finish before the deadline.
+    set_time_remaining(time_remaining)
     return FireworksCaptioner()
 
 
@@ -90,6 +93,28 @@ FALLBACK_CAPTION_BY_STYLE = {
 def fallback_captions(styles, reason: str = "processing error") -> dict:
     print(f"[fallback] using generic style captions ({reason}) for: {', '.join(styles)}")
     return {s: FALLBACK_CAPTION_BY_STYLE.get(s, FALLBACK_CAPTION_BY_STYLE["formal"]) for s in styles}
+
+
+def _start_delay(index: int) -> float:
+    """Staggered start for the clip at scheduling position `index`, capped so
+    the ramp costs a couple of seconds of a 540s budget at most."""
+    if not config.HARDEN_START_STAGGER:
+        return 0.0
+    return min(index * config.START_STAGGER_SECONDS, config.START_STAGGER_MAX_SECONDS)
+
+
+def print_health_summary(results: list, elapsed: float) -> None:
+    """Count how much of the output is generic fallback. This is the number
+    that decides whether a run was healthy: a generic caption keeps its style
+    credit but scores ~0 on accuracy, so every fallback style costs roughly
+    half a clip. A board score well under the local score, with fallbacks
+    here, means the judge box starved us — not that the captions got worse."""
+    generic = set(FALLBACK_CAPTION_BY_STYLE.values())
+    fb_styles = sum(1 for r in results for c in r.get("captions", {}).values() if c in generic)
+    fb_clips = sum(1 for r in results
+                   if any(c in generic for c in r.get("captions", {}).values()))
+    print(f"[health] clips={len(results)} elapsed={elapsed:.1f}s "
+          f"fallback_clips={fb_clips} fallback_styles={fb_styles}")
 
 
 def guarded_polish(judge: JudgeAssistant, style: str, scene: str, prompt_caption: str,
@@ -137,11 +162,20 @@ def order_tasks_heaviest_first(tasks: list) -> list:
     return sorted(tasks, key=lambda t: weights.get(t.get("task_id"), 0.0), reverse=True)
 
 
-def process_task(task: dict, captioner, judge: JudgeAssistant, variety_index: int = 0) -> dict:
+def process_task(task: dict, captioner, judge: JudgeAssistant, variety_index: int = 0,
+                 start_delay: float = 0.0) -> dict:
     task_id = task.get("task_id", "unknown")
     video_url = task.get("video_url")
     styles = task.get("styles") or sorted(config.REQUIRED_STYLES)
     local_path = None
+
+    # Ramp the batch instead of spiking it: CONCURRENCY clips x 4 styles means
+    # up to 24 vision calls hitting Fireworks in the same instant, which is
+    # what trips 429s. Sleeping here (in the worker) rather than at submit time
+    # keeps the main thread free. This delays a call; it never caps how many
+    # may be in flight — that cap is what starved r6.
+    if start_delay > 0:
+        time.sleep(start_delay)
 
     if not video_url:
         print(f"[error] task {task_id} is missing video_url")
@@ -172,7 +206,7 @@ def process_task(task: dict, captioner, judge: JudgeAssistant, variety_index: in
             final_captions = {}
             try:
                 final_captions = qwen_direct.caption_clip_qwen_direct(
-                    captioner, ensure_downloaded, styles, time_remaining)
+                    captioner, ensure_downloaded, styles, time_remaining, video_url)
             except Exception as e:
                 print(f"[qwen-direct] task {task_id} failed wholesale: {e}")
                 traceback.print_exc()
@@ -365,8 +399,9 @@ def main():
     # prompts.NON_TECH_OPENINGS.
     futures = {
         pool.submit(process_task, task, captioner, judge,
-                    original_order.get(task.get("task_id"), 0)): task
-        for task in scheduled_tasks
+                    original_order.get(task.get("task_id"), 0),
+                    _start_delay(i)): task
+        for i, task in enumerate(scheduled_tasks)
     }
 
     # Hard rule: never wait past the global deadline (minus a finalization
@@ -411,6 +446,7 @@ def main():
     elapsed = time.monotonic() - START_TIME
     print(f"[+] Wrote {len(results)} results to {config.OUTPUT_PATH} in {elapsed:.1f}s "
           f"({len(not_done)} timed out)")
+    print_health_summary(results, elapsed)
 
     sys.stdout.flush()
     sys.stderr.flush()
