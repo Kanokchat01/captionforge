@@ -74,3 +74,16 @@ docker push ghcr.io/blackkidx/captionforge:latest
 ```
 
 Timeline ที่ต้องรู้: ระบบตรวจใช้เวลา ~3 ชม. 20 นาที — ถ้าต้องการให้คะแนนกลับก่อน deadline (~12:40) ต้องส่งภายใน ~09:15
+
+## 7. บันทึกเหตุการณ์ต่อเนื่อง
+
+**พบว่า `:latest` เพี้ยนอีกรอบ:** เช็ค GHCR package page พบว่า `ghcr.io/blackkidx/captionforge:latest` ชี้ไปที่ digest `sha256:0ce2e0218c4b...` ซึ่งตรงกับ `v6-r6` (ไม่ใช่ r1) — เป็นเศษตกค้างจากเหตุการณ์ submit ชนกันคืนก่อนหน้า (พร้อมกับที่ kanokchat01 โดนตรวจเป็น 0.77) ไม่มีใครตั้งใจ push ตัวนี้
+
+**ตรวจสอบ r1 ก่อนแก้ (ผ่านทุกชั้น):**
+- Source: `qwen_direct.py` + `fireworks_vision_client.py` SHA256 ตรงกับ `_r1_src/` เป๊ะ; `prompts.py` เนื้อหา r1 เป็น prefix ที่ไม่ถูกแตะ; `config.py`/`main.py` diff เป็นการเพิ่มเท่านั้น ไม่แตะ path `qwen_direct`
+- Image: `docker inspect captionforge:v6-r1` digest `sha256:056814bcc5f2...` ตรงกับ `ghcr.io/blackkidx/captionforge:v6-r1` ที่เคย push ไปแล้วเป๊ะ (สร้าง 12 ก.ค. 08:49 UTC ก่อนเหตุการณ์ทั้งหมด)
+- Fresh eval (generate ใหม่ 15 คลิป ไม่ใช่ eval ซ้ำของเก่า): **0.9192** (≥ baseline 0.9142) — โค้ดที่ restore มาทำงานถูกต้อง
+
+**แก้ไขแล้ว:** `docker tag captionforge:v6-r1 ghcr.io/blackkidx/captionforge:latest` → `docker push` สำเร็จ, digest ปลายทาง `sha256:056814bcc5f291b5...` ตรงกับ v6-r1 ยืนยันแล้ว — **`:latest` กลับมาเป็น r1 (0.90) เรียบร้อย**
+
+รอผลตรวจรอบใหม่ (~3 ชม. 20 นาทีจากนี้) + ติดตาม ticket ที่แจ้งผู้จัดไว้เรื่องความล่าช้า
