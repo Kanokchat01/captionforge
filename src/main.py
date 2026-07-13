@@ -225,7 +225,7 @@ def process_task(task: dict, captioner, judge: JudgeAssistant, variety_index: in
             final_captions = {}
             try:
                 final_captions = minimax_single.caption_clip_minimax_single(
-                    captioner, ensure_downloaded, styles, time_remaining)
+                    captioner, ensure_downloaded, styles, time_remaining, video_url)
             except Exception as e:
                 print(f"[minimax-single] task {task_id} failed wholesale: {e}")
                 traceback.print_exc()

@@ -109,17 +109,28 @@ def _attempt(captioner, frames_b64: List[str], styles: List[str],
 
 def caption_clip_minimax_single(captioner, ensure_downloaded: Callable[[], str],
                                 styles: List[str],
-                                time_remaining: Callable[[], float]) -> Dict[str, str]:
+                                time_remaining: Callable[[], float],
+                                video_url: str = "") -> Dict[str, str]:
     """All requested styles for one clip in ONE call (+ guards). A single
     style's failure returns "" for that style only; raises only when the
     frames stage itself fails (caller falls back for the whole clip)."""
-    local_path = ensure_downloaded()
+    try:
+        source = ensure_downloaded()
+    except Exception as e:
+        # A dead download used to cost the entire clip — four generic captions,
+        # zero accuracy. ffmpeg can range-request the frames straight out of the
+        # URL instead (same rung qwen_direct grew in v7).
+        if not (config.HARDEN_URL_FRAME_FALLBACK and video_url):
+            raise
+        print(f"[minimax-single] download failed ({e}) — reading frames directly from the URL")
+        source = video_url
+
     t0 = time.monotonic()
-    duration = _probe_duration_seconds(local_path)
+    duration = _probe_duration_seconds(source)
     n_frames = max(config.MINIMAX_SINGLE_MIN_FRAMES,
                    min(config.MINIMAX_SINGLE_MAX_FRAMES,
                        int(round(duration / config.MINIMAX_SINGLE_SECONDS_PER_FRAME))))
-    frames_b64 = extract_frames_b64(local_path, n_frames,
+    frames_b64 = extract_frames_b64(source, n_frames,
                                     config.MINIMAX_SINGLE_FRAME_MAX_WIDTH)
     print(f"[minimax-single] {len(frames_b64)} frames "
           f"@{config.MINIMAX_SINGLE_FRAME_MAX_WIDTH}px in {time.monotonic() - t0:.2f}s")

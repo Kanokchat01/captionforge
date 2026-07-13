@@ -30,7 +30,16 @@ ARG FIREWORKS_API_KEY=""
 ENV FIREWORKS_API_KEY=${FIREWORKS_API_KEY}
 
 # --- v6 engine knobs (baked per submission rung; empty string = default) ---
-ARG CAPTION_ASSEMBLY="qwen_direct"
+# v8: shipped engine is minimax_single — ONE JSON call per clip for all four
+# styles. qwen_direct's 4-calls-per-clip put 16 requests in flight at once and
+# 48-90 on the wire per run; the board scored that 0.66 and 0.69 (~4-5 of 12
+# clips lost to 429s and shipped as generic fallbacks). Both teams currently
+# scoring 0.91 use one call per clip. This is a call-volume fix, not a prompt
+# change: the personas are r1's, verbatim.
+ARG CAPTION_ASSEMBLY="minimax_single"
+# Which model answers the single JSON call. SwiftCap (0.91) runs minimax-m3.
+ARG MINIMAX_SINGLE_MODEL=""
+ENV MINIMAX_SINGLE_MODEL=${MINIMAX_SINGLE_MODEL}
 # Empty = config default (qwen3p7-plus). Baked for the minimax model-swap
 # rung (E1): --build-arg QWEN_DIRECT_MODEL=accounts/fireworks/models/minimax-m3
 ARG QWEN_DIRECT_MODEL=""
@@ -49,11 +58,12 @@ ENV CAPTION_ASSEMBLY=${CAPTION_ASSEMBLY} \
     QWEN_DIRECT_TEMP_HUMOROUS_TECH=${QWEN_DIRECT_TEMP_HUMOROUS_TECH} \
     QWEN_DIRECT_TEMP_HUMOROUS_NON_TECH=${QWEN_DIRECT_TEMP_HUMOROUS_NON_TECH}
 
-# 6 clips x 4 styles = 24 parallel vision calls, which clusters into 429s;
-# 4x4=16 keeps under it and the engine is fast enough (~10s/clip) that the
-# 540s budget still clears with huge headroom. This is the value baked into
-# the board-verified 0.90 image — do not change it without a board re-verify.
-ENV CONCURRENCY="4"
+# With minimax_single there is exactly ONE call per clip, so CONCURRENCY *is*
+# the number of requests in flight: 2, against the 16 that qwen_direct put up.
+# SwiftCap runs its 12 clips strictly sequentially (1 in flight) and scores
+# 0.91, so 2 is already the aggressive end of proven territory. 12 clips at
+# ~20-30s each, 2 at a time, lands around 150-200s of the 540s budget.
+ENV CONCURRENCY="2"
 
 # NOTE: there is deliberately no QWEN_DIRECT_MAX_INFLIGHT here. r6 added a
 # global semaphore capping TOTAL in-flight vision calls at 3 while the

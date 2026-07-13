@@ -61,7 +61,7 @@ JUDGE_TEXT_MODELS = [
     "accounts/fireworks/models/deepseek-v4-pro",
 ]
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_VISION_MODEL = os.environ.get("EVAL_VISION_MODEL", "google/gemini-2.5-flash")
+OPENROUTER_VISION_MODEL = os.environ.get("EVAL_VISION_MODEL", "google/gemini-3.5-flash")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 JUDGE_FRAMES = 4
 JUDGE_FRAME_WIDTH = 1024
