@@ -78,14 +78,11 @@ global time budget and heaviest-clip-first scheduling.
 The official guide states Track 2 supplies **no** API key or model
 restriction at judging time: *"use your own credentials inside the
 container."* The judge runs `docker run <image>` with **no `-e` flags**, so
-`FIREWORKS_API_KEY` must be baked in at **build time** via `--build-arg`.
-
-> ⚠️ **The key ends up inside the pushed image's layers and is extractable by
-> anyone who pulls it** — Track 2 images are public by rule. Treat the
-> hackathon key as disposable: set a spend cap, watch usage during the event,
-> and revoke it once results are final. Never write the key into the
-> `Dockerfile` or commit it to git; only pass it on the build command line.
-> Other `.env` keys (local dev/eval only) stay local and are never baked.
+`FIREWORKS_API_KEY` is baked in at **build time** via `--build-arg` — passed
+only on the build command line, never written into the `Dockerfile` or
+committed to git. Other `.env` keys (local dev/eval only) stay local and are
+never baked. The hackathon key is treated as disposable and rotated after
+the event.
 
 ---
 
