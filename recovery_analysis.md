@@ -87,3 +87,53 @@ Timeline ที่ต้องรู้: ระบบตรวจใช้เว
 **แก้ไขแล้ว:** `docker tag captionforge:v6-r1 ghcr.io/blackkidx/captionforge:latest` → `docker push` สำเร็จ, digest ปลายทาง `sha256:056814bcc5f291b5...` ตรงกับ v6-r1 ยืนยันแล้ว — **`:latest` กลับมาเป็น r1 (0.90) เรียบร้อย**
 
 รอผลตรวจรอบใหม่ (~3 ชม. 20 นาทีจากนี้) + ติดตาม ticket ที่แจ้งผู้จัดไว้เรื่องความล่าช้า
+
+---
+
+## 8. 0.69 บนบอร์ด (13 ก.ค. 14:12) — ไม่ใช่คะแนนของ r1
+
+**ไทม์ไลน์พิสูจน์:** บอร์ด scored 14:12 · ระบบตรวจใช้ ~3 ชม. 20 นาที ⇒ pull image ตอน ~10:50 · แต่เราเพิ่ง retag `:latest` → r1 ตอน **11:18** (commit 62516e8) ⇒ **ตัวที่โดนตรวจได้ 0.69 คือ r6 ที่ค้างอยู่** ส่วน r1 ที่ resubmit 15:00 ยังตรวจไม่เสร็จ (คาด ~18:20)
+
+**ลายเซ็นของเลข 0.69:** generic fallback ได้ style ~0.5 แต่ accuracy ~0 ⇒ ~0.25/คลิป
+แก้ `0.91 − (k/12) × 0.66 = 0.69` ⇒ **k ≈ 4 คลิปตกไป fallback** — ตรงกับที่ r6 ใส่ `_INFLIGHT` semaphore จำกัด in-flight call ไว้ 3 ทั้งที่ pipeline ต้องการ 16 (CONCURRENCY=4 × 4 สไตล์) บนเครื่องตรวจที่ช้ากว่า ⇒ ไล่ไม่ทัน ชน time cutoff ⇒ generic fallback
+**ไม่ใช่ปัญหา prompt** — prompt r1 คือตัวที่ทำ 0.90
+
+## 9. v7-hard — candidate สำรอง (`ghcr.io/blackkidx/captionforge:v7-hard`)
+
+หลักการ: **happy path เหมือน r1 ทุกอย่าง** (prompt/model/4 เฟรม@1024/temp 0.7/backoff [3,6] เดิมเป๊ะ) แก้เฉพาะ failure path ทุกตัวมี env flag `HARDEN_*` ปิดได้โดยไม่ต้อง build ใหม่
+
+| | สิ่งที่แก้ |
+|---|---|
+| H1 | retry มี jitter + รู้เวลาเหลือ (ไม่ sleep เข้าไปใน retry ที่ยังไงก็ไม่ทัน) |
+| H2 | stagger เวลาเริ่มของแต่ละคลิป — **ไม่ใช่ semaphore** (semaphore คือตัวที่ฆ่า r6) |
+| H3 | ขั้นบันไดกู้ก่อนถึง generic fallback: emergency 1 เฟรม → re-voice ข้อเท็จจริงจากสไตล์ที่สำเร็จ |
+| H4 | `[health] fallback_clips=N` telemetry |
+| H5 | ดึงเฟรมตรงจาก URL เมื่อ download ตาย (เดิม: download ตาย = เสียทั้งคลิป 4 สไตล์) |
+
+**ผลวัด (15 คลิป, vision judge gemini-2.5-flash):**
+
+| สถานการณ์ | r1 | v7-hard |
+|---|---|---|
+| ปกติ | 0.9142 | **0.9108 / 0.9113** (เท่ากันในกรอบ noise, 0 fallback) |
+| ถูก throttle 75% | 0.8600 (6 คลิปตก) | **0.9133** (1 คลิปตก) |
+| download ตายหมด | เสีย 15/15 คลิป | เสีย 7/15 (กู้ได้ 8 คลิป) |
+| zero-flag docker | — | 281s/600s, 15×4 ครบ, fallback_clips=0 |
+
+⇒ **v7-hard ไม่เคยแย่กว่า r1 และดีกว่ามากตอนเจอปัญหา**
+
+## 10. กติกาตัดสินใจตอนผล r1 ออก (~18:20)
+
+ผู้จัดตรวจ **image ตัวสุดท้ายที่ `:latest` ชี้อยู่ หลัง deadline** ⇒ `:latest` ณ ตอน cutoff = คะแนนจริง
+
+- **r1 ≥ 0.88** → เครื่องตรวจปกติ, 0.69 คืออุบัติเหตุ image ล้วน ๆ → **คง `:latest` = r1 ไม่ต้องทำอะไร** (สาขาที่คาด)
+- **r1 ออกมา ~0.69–0.80** → ยืนยันว่าเครื่องตรวจ starve เรา คลิปตก fallback → **สลับ `:latest` → v7-hard** (ตัวเดียวที่แก้อาการนี้ตรงจุด)
+- **r1 ไม่ทันตรวจ** → คง `:latest` = r1 (มีบอร์ดยืนยัน) ห้ามเสี่ยงกับตัวที่ไม่เคยขึ้นบอร์ด
+
+คำสั่งสลับ (กดเองเมื่อตัดสินใจแล้วเท่านั้น + เคลียร์กับทีมก่อน):
+```powershell
+docker tag captionforge:v7-hard ghcr.io/blackkidx/captionforge:latest
+docker push ghcr.io/blackkidx/captionforge:latest
+```
+ย้อนกลับเป็น r1: `docker tag ghcr.io/blackkidx/captionforge:v6-r1 ghcr.io/blackkidx/captionforge:latest; docker push ...`
+
+digest ปัจจุบัน: `:latest` = `:v6-r1` = `sha256:d2f1cba8a0b5...` · `:v7-hard` = `sha256:e78d3c3091c2...`
