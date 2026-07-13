@@ -6,11 +6,16 @@ Docker (see ../src/main.py: reads /input/tasks.json, writes
 /output/results.json, no UI). This Flask app exists to try the pipeline
 interactively during development and to record the hackathon demo video.
 
-It reuses the exact same pipeline code the submission uses
+It imports the same building blocks as the submission
 (fireworks_vision_client.FireworksCaptioner, judge_polish.JudgeAssistant,
-downloader.py, config.py, prompts.py) -- including the same Best-of-N
-selection, word-count guard, and self-critique loop -- so what you see here
-matches what the judged container would produce for the same clip.
+downloader.py, config.py, prompts.py) and shares the same style checks and
+grounding rules. It drives them through the earlier scene-report ->
+Best-of-N -> judge -> self-critique pipeline, which streams cleanly stage by
+stage and is nice to watch. The SHIPPED submission runs a leaner engine
+(minimax_single: one JSON call per clip returning all four styles -- see
+../src/minimax_single.py and CAPTION_ASSEMBLY in the Dockerfile), so treat
+this UI as an illustrative walkthrough of the project's stages and guards,
+not a byte-for-byte reproduction of the judged container's output.
 
 /api/generate streams newline-delimited JSON (NDJSON) so the UI can show real
 pipeline progress instead of a spinner: the clip takes 20-90s to process.
