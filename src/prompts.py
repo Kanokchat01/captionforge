@@ -647,6 +647,12 @@ QWEN_DIRECT_PERSONAS = {
         "lag, endless loading bars. Keep the real scene clearly recognizable "
         "underneath the joke."
     ),
+    # Tried and REVERTED 2026-07-13 19:00: rewriting this to demand "an actual
+    # punchline, never a plain description" (humorous_non_tech is the weakest
+    # style on every judge) moved it 0.882 -> 0.883 on the strict judge while
+    # dragging the other three down — 0.9329 -> 0.9246 overall. The weakness is
+    # real but this wording is not the fix, and chasing it on a noisy signal is
+    # exactly how r6 broke. Keep r1's wording.
     "humorous_non_tech": (
         "Joke like the funny uncle at a family dinner: warm everyday "
         "comparisons about food, chores, weather, pets, or naps. Use zero "

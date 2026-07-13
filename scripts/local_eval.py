@@ -62,6 +62,9 @@ JUDGE_TEXT_MODELS = [
 ]
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_VISION_MODEL = os.environ.get("EVAL_VISION_MODEL", "google/gemini-3.5-flash")
+# EVAL_STRICT=true swaps in the harsh, anchored rubric below. Needed on
+# gemini-3.5-flash, which otherwise scores ~90% of captions a flat 1.00.
+EVAL_STRICT = os.environ.get("EVAL_STRICT", "").strip().lower() == "true"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 JUDGE_FRAMES = 4
 JUDGE_FRAME_WIDTH = 1024
@@ -84,6 +87,42 @@ EVAL_TEXT_SYSTEM_PROMPT = (
     "- style_match: the caption genuinely lands the official style definition "
     "(tone, intent, and for humorous styles, whether it is actually funny "
     "about THIS scene rather than generic filler).\n"
+    'Respond with ONLY a JSON object: {"accuracy": <0-1>, "style_match": <0-1>}'
+)
+
+# Strict variant (EVAL_STRICT=true). gemini-3.5-flash saturates the prompt
+# below — it handed 0.9875 to the exact build the real board scored 0.66, and
+# marked ~90% of captions a flat 1.00, which is no signal at all. A generous
+# judge is worse than no judge: it launders weak captions as perfect. This
+# version anchors the scale (1.0 must be EARNED, default is 0.7), forces the
+# model to name the unsupported claims BEFORE it scores, and bans the lazy
+# round numbers it defaults to.
+EVAL_VISION_STRICT_SYSTEM_PROMPT = (
+    "You are the automated judge of a video-captioning contest, and you are "
+    "known for being harsh. You are shown still frames sampled uniformly from "
+    "the actual clip — the frames are the ONLY ground truth — plus the "
+    "contest's official one-line definition of a caption style, and one "
+    "caption.\n\n"
+    "First, silently list every factual claim the caption makes. Mark each one "
+    "SUPPORTED (clearly visible in the frames) or UNSUPPORTED (contradicted, "
+    "invented, embellished, or merely plausible but not actually shown). Then "
+    "score.\n\n"
+    "Scoring anchors — a competent, unremarkable caption starts at 0.7, NOT "
+    "1.0. Reserve 1.0 for captions with no flaw you can name:\n"
+    "- accuracy: 1.0 = every claim supported AND it names several specific "
+    "visible details. 0.8 = all claims supported but generic enough to fit "
+    "many videos. 0.5 = one unsupported/embellished claim. 0.2 = a claim that "
+    "contradicts the frames, quoted on-screen text, or a named real city/"
+    "country/landmark. 0.0 = describes a different scene.\n"
+    "- style_match: 1.0 = unmistakably the assigned style, and for humorous "
+    "styles genuinely funny ABOUT THIS SCENE. 0.7 = right register but bland "
+    "or interchangeable with another style. 0.4 = drifts into a neighbouring "
+    "style, or the joke is generic filler that would work on any clip. 0.1 = "
+    "wrong style, or humorous_non_tech containing technical jargon, or "
+    "humorous_tech containing no technology reference.\n\n"
+    "Do not be charitable. If you cannot name a reason a caption deserves 1.0, "
+    "it does not get 1.0. Use the full range including values like 0.65, 0.75, "
+    "0.85 — do not round everything to 0.9 or 1.0.\n"
     'Respond with ONLY a JSON object: {"accuracy": <0-1>, "style_match": <0-1>}'
 )
 
@@ -158,7 +197,8 @@ def judge_vision_once(style: str, frames_b64: list, caption: str) -> dict:
                 json={
                     "model": OPENROUTER_VISION_MODEL,
                     "messages": [
-                        {"role": "system", "content": EVAL_VISION_SYSTEM_PROMPT},
+                        {"role": "system", "content": EVAL_VISION_STRICT_SYSTEM_PROMPT
+                         if EVAL_STRICT else EVAL_VISION_SYSTEM_PROMPT},
                         {"role": "user", "content": content},
                     ],
                     "max_tokens": 200,
